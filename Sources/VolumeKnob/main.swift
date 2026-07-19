@@ -4,7 +4,7 @@ import Combine
 import CoreAudio
 import AVFoundation
 import Accelerate
-import ScreenCaptureKit
+@preconcurrency import ScreenCaptureKit
 
 enum SpectrumSource: String, CaseIterable, Identifiable {
     case automatic = "Auto"
