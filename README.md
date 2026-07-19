@@ -14,6 +14,7 @@ Volume Knob is free to download and use. If it helps you, please consider a **su
 
 - Floating, always-on-top glass panel
 - Rotary drag and click control
+- Glowing red volume hash marks surrounding the green dial ring
 - Standard volume slider
 - Volume up and down buttons
 - Large mute/unmute button
@@ -74,6 +75,7 @@ To open Volume Knob automatically, add it under **System Settings â†’ General â†
 - Open the **Privacy** tab to start a capped privacy-noise signal, set its type and timer, or enable the microphone noise detector.
 - Use **Speaker Setup** to open Audio MIDI Setup. Create and select a Multi-Output Device to broadcast through several compatible speakers.
 - Start connected amplifiers at a low level. The in-app generator is capped, but external hardware can still make the output dangerously loud.
+- Privacy Noise starts at 26% and can be raised to 60%; increase it gradually, especially with amplified or multi-speaker outputs.
 
 ## Project layout
 

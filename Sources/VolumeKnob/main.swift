@@ -39,7 +39,7 @@ private final class NoiseRenderState: @unchecked Sendable {
     func configure(type: PrivacyNoiseType, amplitude: Float) {
         lock.lock()
         self.type = type
-        targetAmplitude = min(max(amplitude, 0), 0.12)
+        targetAmplitude = min(max(amplitude, 0), 0.20)
         lock.unlock()
     }
 
@@ -71,7 +71,7 @@ private final class NoiseRenderState: @unchecked Sendable {
                 rawSample = (speechFast - speechSlow) * 1.35
             }
 
-            let sample = min(max(rawSample * currentAmplitude, -0.12), 0.12)
+            let sample = min(max(rawSample * currentAmplitude, -0.20), 0.20)
             for buffer in audioBufferList {
                 guard let data = buffer.mData?.assumingMemoryBound(to: Float.self) else { continue }
                 let channelCount = max(Int(buffer.mNumberChannels), 1)
@@ -94,7 +94,7 @@ final class PrivacyNoiseController: ObservableObject {
     @Published var noiseType: PrivacyNoiseType = .pink {
         didSet { updateRenderState() }
     }
-    @Published var volume: Double = 0.18 {
+    @Published var volume: Double = 0.26 {
         didSet { updateRenderState() }
     }
     @Published var timerMinutes = 0
@@ -156,7 +156,7 @@ final class PrivacyNoiseController: ObservableObject {
 
     private func updateRenderState(playing: Bool? = nil) {
         let shouldPlay = playing ?? isPlaying
-        let safeAmplitude = shouldPlay ? Float(min(volume, 0.35)) * 0.30 : 0
+        let safeAmplitude = shouldPlay ? Float(min(volume, 0.60)) * 0.30 : 0
         renderState.configure(type: noiseType, amplitude: safeAmplitude)
     }
 
@@ -617,30 +617,35 @@ final class AudioController: ObservableObject {
     func refresh() {
         guard let device = defaultOutputDevice() else { return }
 
-        var volumeAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyVolumeScalar,
-            mScope: kAudioDevicePropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var newVolume: Float32 = volume
-        var volumeSize = UInt32(MemoryLayout<Float32>.size)
-        if AudioObjectGetPropertyData(device, &volumeAddress, 0, nil, &volumeSize, &newVolume) == noErr {
-            volume = newVolume
-        }
-
-        var muteAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyMute,
-            mScope: kAudioDevicePropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        if AudioObjectHasProperty(device, &muteAddress) {
-            var muteValue: UInt32 = 0
-            var muteSize = UInt32(MemoryLayout<UInt32>.size)
-            if AudioObjectGetPropertyData(device, &muteAddress, 0, nil, &muteSize, &muteValue) == noErr {
-                isMuted = muteValue != 0
-            }
+        if let settings = readSystemVolumeSettings() {
+            volume = settings.volume
+            isMuted = settings.muted
         } else {
-            isMuted = volume <= 0.001
+            var volumeAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyVolumeScalar,
+                mScope: kAudioDevicePropertyScopeOutput,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var newVolume: Float32 = volume
+            var volumeSize = UInt32(MemoryLayout<Float32>.size)
+            if AudioObjectGetPropertyData(device, &volumeAddress, 0, nil, &volumeSize, &newVolume) == noErr {
+                volume = newVolume
+            }
+
+            var muteAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyMute,
+                mScope: kAudioDevicePropertyScopeOutput,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            if AudioObjectHasProperty(device, &muteAddress) {
+                var muteValue: UInt32 = 0
+                var muteSize = UInt32(MemoryLayout<UInt32>.size)
+                if AudioObjectGetPropertyData(device, &muteAddress, 0, nil, &muteSize, &muteValue) == noErr {
+                    isMuted = muteValue != 0
+                }
+            } else {
+                isMuted = volume <= 0.001
+            }
         }
 
         deviceName = outputDeviceName(device) ?? "Mac Audio"
@@ -663,6 +668,17 @@ final class AudioController: ObservableObject {
         guard let script = NSAppleScript(source: source) else { return false }
         script.executeAndReturnError(&error)
         return error == nil
+    }
+
+    private func readSystemVolumeSettings() -> (volume: Float, muted: Bool)? {
+        var volumeError: NSDictionary?
+        var muteError: NSDictionary?
+        guard let volumeScript = NSAppleScript(source: "output volume of (get volume settings)"),
+              let muteScript = NSAppleScript(source: "output muted of (get volume settings)") else { return nil }
+        let volumeResult = volumeScript.executeAndReturnError(&volumeError)
+        let muteResult = muteScript.executeAndReturnError(&muteError)
+        guard volumeError == nil, muteError == nil else { return nil }
+        return (Float(volumeResult.int32Value) / 100, muteResult.booleanValue)
     }
 
     private func outputDeviceName(_ device: AudioDeviceID) -> String? {
@@ -885,7 +901,7 @@ struct PrivacyNoiseView: View {
 
             HStack(spacing: 8) {
                 Image(systemName: "speaker.fill")
-                Slider(value: $noise.volume, in: 0.05...0.35)
+                Slider(value: $noise.volume, in: 0.05...0.60)
                     .tint(.green)
                     .accessibilityLabel("Privacy noise level")
                 Text("\(Int(noise.volume * 100))%")
@@ -963,6 +979,21 @@ struct RotaryKnob: View {
                 .fill(.black.opacity(0.32))
                 .overlay(Circle().stroke(.white.opacity(0.12), lineWidth: 1))
                 .shadow(color: .black.opacity(0.35), radius: 18, y: 10)
+
+            ForEach(0..<31, id: \.self) { index in
+                let isMajorMark = index % 5 == 0
+                let isActive = !audio.isMuted && Double(index) / 30.0 <= effectiveVolume
+                Capsule()
+                    .fill(Color.red.opacity(isActive ? 1.0 : 0.22))
+                    .frame(width: isMajorMark ? 3 : 2, height: isMajorMark ? 11 : 7)
+                    .offset(y: -71)
+                    .rotationEffect(.degrees(-135 + Double(index) * 9))
+                    .shadow(
+                        color: Color.red.opacity(isActive ? 0.95 : 0.16),
+                        radius: isActive ? 4.5 : 1
+                    )
+            }
+            .animation(.easeOut(duration: 0.12), value: effectiveVolume)
 
             Circle()
                 .trim(from: 0, to: effectiveVolume * 0.75)
@@ -1114,7 +1145,7 @@ struct VolumeControlView: View {
         }
         .padding(18)
         .frame(width: 300, height: 560, alignment: .top)
-        .background(Color.black.opacity(0.22))
+        .background(Color.black.opacity(0.42))
     }
 }
 
