@@ -1,0 +1,10 @@
+.DS_Store
+.build/
+.swiftpm/
+build/
+build-v*/
+dist/
+DerivedData/
+*.xcuserstate
+*.zip
+
