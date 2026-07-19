@@ -22,6 +22,10 @@ Volume Knob is free to download and use. If it helps you, please consider a **su
 - Dedicated Mac Audio and Microphone modes
 - Sound-reactive glow around the knob
 - Optional Smart Level with Gentle-to-Strong control for consistent track loudness
+- Privacy screen with white, pink, brown, and speech-shaped noise
+- Adjustable microphone noise detector with spectrum alerts and calibration
+- Multi-speaker broadcasting through a macOS Multi-Output Device
+- Optional 15, 30, or 60 minute privacy-noise timer
 - Bluetooth and external-speaker support
 - Menu-bar access
 - No accounts, analytics, network requests, or audio recording
@@ -67,6 +71,9 @@ To open Volume Knob automatically, add it under **System Settings â†’ General â†
 - Select the speaker icon in the menu bar for quick access.
 - Choose **Auto**, **Mac Audio**, or **Microphone** beside the spectrum. Auto switches to the microphone after Mac audio is quiet for about one second.
 - Turn on **Smart Level** to slowly balance louder and quieter recordings. Set the strength from **Gentle** to **Strong**. Smart Level responds only to Mac audio and pauses when music stops or output is muted.
+- Open the **Privacy** tab to start a capped privacy-noise signal, set its type and timer, or enable the microphone noise detector.
+- Use **Speaker Setup** to open Audio MIDI Setup. Create and select a Multi-Output Device to broadcast through several compatible speakers.
+- Start connected amplifiers at a low level. The in-app generator is capped, but external hardware can still make the output dangerously loud.
 
 ## Project layout
 

@@ -14,12 +14,237 @@ enum SpectrumSource: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum PrivacyNoiseType: String, CaseIterable, Identifiable {
+    case pink = "Pink"
+    case brown = "Brown"
+    case white = "White"
+    case speech = "Speech Mask"
+
+    var id: String { rawValue }
+}
+
+private final class NoiseRenderState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var type: PrivacyNoiseType = .pink
+    private var targetAmplitude: Float = 0
+    private var currentAmplitude: Float = 0
+    private var randomState: UInt64 = 0x5EED_1234_ABCD_9876
+    private var pink0: Float = 0
+    private var pink1: Float = 0
+    private var pink2: Float = 0
+    private var brown: Float = 0
+    private var speechFast: Float = 0
+    private var speechSlow: Float = 0
+
+    func configure(type: PrivacyNoiseType, amplitude: Float) {
+        lock.lock()
+        self.type = type
+        targetAmplitude = min(max(amplitude, 0), 0.12)
+        lock.unlock()
+    }
+
+    func render(frameCount: AVAudioFrameCount, audioBufferList: UnsafeMutableAudioBufferListPointer) {
+        lock.lock()
+        let selectedType = type
+        let target = targetAmplitude
+        lock.unlock()
+
+        for frame in 0..<Int(frameCount) {
+            currentAmplitude += (target - currentAmplitude) * 0.0025
+            let white = nextWhite()
+            let rawSample: Float
+
+            switch selectedType {
+            case .white:
+                rawSample = white * 0.58
+            case .pink:
+                pink0 = 0.99765 * pink0 + white * 0.0990460
+                pink1 = 0.96300 * pink1 + white * 0.2965164
+                pink2 = 0.57000 * pink2 + white * 1.0526913
+                rawSample = (pink0 + pink1 + pink2 + white * 0.1848) * 0.16
+            case .brown:
+                brown = min(max((brown + white * 0.018) / 1.018, -1), 1)
+                rawSample = brown * 0.82
+            case .speech:
+                speechFast += (white - speechFast) * 0.18
+                speechSlow += (white - speechSlow) * 0.012
+                rawSample = (speechFast - speechSlow) * 1.35
+            }
+
+            let sample = min(max(rawSample * currentAmplitude, -0.12), 0.12)
+            for buffer in audioBufferList {
+                guard let data = buffer.mData?.assumingMemoryBound(to: Float.self) else { continue }
+                let channelCount = max(Int(buffer.mNumberChannels), 1)
+                for channel in 0..<channelCount {
+                    data[frame * channelCount + channel] = sample
+                }
+            }
+        }
+    }
+
+    private func nextWhite() -> Float {
+        randomState = randomState &* 6_364_136_223_846_793_005 &+ 1
+        let value = Float((randomState >> 40) & 0xFF_FFFF) / Float(0xFF_FFFF)
+        return value * 2 - 1
+    }
+}
+
+@MainActor
+final class PrivacyNoiseController: ObservableObject {
+    @Published var noiseType: PrivacyNoiseType = .pink {
+        didSet { updateRenderState() }
+    }
+    @Published var volume: Double = 0.18 {
+        didSet { updateRenderState() }
+    }
+    @Published var timerMinutes = 0
+    @Published private(set) var isPlaying = false
+    @Published private(set) var status = "Ready"
+
+    private let engine = AVAudioEngine()
+    private let renderState = NoiseRenderState()
+    private var sourceNode: AVAudioSourceNode?
+    private var stopDate: Date?
+    private var countdownTimer: Timer?
+
+    init() {
+        countdownTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.updateCountdown() }
+        }
+    }
+
+    func toggle() {
+        isPlaying ? stop() : start()
+    }
+
+    func start() {
+        if sourceNode == nil {
+            let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+            let node = Self.makeSourceNode(format: format, state: renderState)
+            engine.attach(node)
+            engine.connect(node, to: engine.mainMixerNode, format: format)
+            sourceNode = node
+        }
+
+        updateRenderState(playing: true)
+        do {
+            engine.prepare()
+            try engine.start()
+            isPlaying = true
+            stopDate = timerMinutes > 0 ? Date().addingTimeInterval(Double(timerMinutes * 60)) : nil
+            updateCountdown()
+        } catch {
+            updateRenderState(playing: false)
+            status = "Output unavailable"
+        }
+    }
+
+    private nonisolated static func makeSourceNode(format: AVAudioFormat, state: NoiseRenderState) -> AVAudioSourceNode {
+        AVAudioSourceNode(format: format) { _, _, frameCount, audioBufferList in
+            state.render(frameCount: frameCount, audioBufferList: UnsafeMutableAudioBufferListPointer(audioBufferList))
+            return noErr
+        }
+    }
+
+    func stop() {
+        updateRenderState(playing: false)
+        engine.stop()
+        isPlaying = false
+        stopDate = nil
+        status = "Ready"
+    }
+
+    private func updateRenderState(playing: Bool? = nil) {
+        let shouldPlay = playing ?? isPlaying
+        let safeAmplitude = shouldPlay ? Float(min(volume, 0.35)) * 0.30 : 0
+        renderState.configure(type: noiseType, amplitude: safeAmplitude)
+    }
+
+    private func updateCountdown() {
+        guard isPlaying else { return }
+        guard let stopDate else {
+            status = "Playing · Continuous"
+            return
+        }
+        let remaining = Int(stopDate.timeIntervalSinceNow.rounded(.up))
+        guard remaining > 0 else {
+            stop()
+            return
+        }
+        status = String(format: "Playing · %d:%02d", remaining / 60, remaining % 60)
+    }
+}
+
+enum SoundAlertState: String {
+    case quiet = "Listening"
+    case detected = "Sound detected"
+    case loud = "Loud sound"
+}
+
+@MainActor
+final class SoundDetectorController: ObservableObject {
+    @Published var isEnabled = false {
+        didSet {
+            if isEnabled {
+                if analyzer?.selectedSource == .system { analyzer?.selectedSource = .automatic }
+                baseline = analyzer?.microphoneLevel ?? 0
+                state = .quiet
+            } else {
+                state = .quiet
+                intensity = 0
+            }
+        }
+    }
+    @Published var sensitivity: Double = 0.58
+    @Published private(set) var state: SoundAlertState = .quiet
+    @Published private(set) var intensity: Float = 0
+
+    private weak var analyzer: SpectrumAnalyzer?
+    private weak var noise: PrivacyNoiseController?
+    private var baseline: Float = 0
+    private var timer: Timer?
+
+    init(analyzer: SpectrumAnalyzer, noise: PrivacyNoiseController) {
+        self.analyzer = analyzer
+        self.noise = noise
+        timer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.sample() }
+        }
+    }
+
+    func recalibrate() {
+        baseline = analyzer?.microphoneLevel ?? 0
+        state = .quiet
+        intensity = 0
+    }
+
+    private func sample() {
+        guard isEnabled, let analyzer else { return }
+        let level = analyzer.microphoneLevel
+        if baseline == 0 { baseline = level }
+        let margin = Float(0.19 - sensitivity * 0.14)
+        let difference = max(level - baseline, 0)
+        intensity = min(difference / max(margin * 1.8, 0.01), 1)
+
+        if difference > margin * 1.8 {
+            state = .loud
+        } else if difference > margin {
+            state = .detected
+        } else {
+            state = .quiet
+            let calibrationRate: Float = noise?.isPlaying == true ? 0.055 : 0.018
+            baseline += (level - baseline) * calibrationRate
+        }
+    }
+}
+
 @MainActor
 final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     @Published private(set) var bands = Array(repeating: Float(0.03), count: 24)
     @Published private(set) var level: Float = 0
     @Published private(set) var activeSource = "Starting…"
     @Published private(set) var systemLoudnessDB: Float = -60
+    @Published private(set) var microphoneLevel: Float = 0
     @Published var selectedSource: SpectrumSource = .automatic {
         didSet { restart() }
     }
@@ -196,6 +421,11 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
         guard generation == self.generation else { return }
         let rms = sqrt(samples.reduce(Float.zero) { $0 + $1 * $1 } / Float(max(samples.count, 1)))
 
+        if origin == .microphone {
+            let normalized = min(rms * 7.5, 1)
+            microphoneLevel += (normalized - microphoneLevel) * 0.28
+        }
+
         if origin == .system, rms > 0.004 {
             lastSystemSignal = Date()
             let measuredDB = 20 * log10(max(rms, 0.000_001))
@@ -255,6 +485,16 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
 
 struct SpectrumView: View {
     @ObservedObject var analyzer: SpectrumAnalyzer
+    @ObservedObject var detector: SoundDetectorController
+
+    private var alertColor: Color {
+        guard detector.isEnabled else { return .green }
+        switch detector.state {
+        case .quiet: return .green
+        case .detected: return .yellow
+        case .loud: return .red
+        }
+    }
 
     var body: some View {
         VStack(spacing: 5) {
@@ -263,17 +503,19 @@ struct SpectrumView: View {
                     Capsule()
                         .fill(
                             LinearGradient(
-                                colors: index > 17 ? [.green, .yellow] : [.green.opacity(0.55), .green],
+                                colors: [alertColor.opacity(0.50), alertColor],
                                 startPoint: .bottom,
                                 endPoint: .top
                             )
                         )
                         .frame(maxWidth: .infinity)
                         .frame(height: 5 + CGFloat(value) * 48)
-                        .shadow(color: .green.opacity(Double(value) * 0.65), radius: 4)
+                        .shadow(color: alertColor.opacity(Double(value) * 0.65), radius: 4)
                 }
             }
             .frame(height: 54, alignment: .bottom)
+            .opacity(detector.isEnabled && detector.state == .quiet ? 0.38 : 1)
+            .animation(.easeOut(duration: 0.12), value: detector.state)
 
             HStack {
                 Text(analyzer.activeSource)
@@ -558,6 +800,144 @@ struct SmartLevelView: View {
     }
 }
 
+struct NoiseDetectorView: View {
+    @ObservedObject var detector: SoundDetectorController
+
+    private var stateColor: Color {
+        switch detector.state {
+        case .quiet: return .green
+        case .detected: return .yellow
+        case .loud: return .red
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 7) {
+            HStack {
+                Toggle(isOn: $detector.isEnabled) {
+                    Label("Noise Detector", systemImage: detector.isEnabled ? "ear.badge.waveform" : "ear")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                .toggleStyle(.switch)
+                .tint(.green)
+                Spacer()
+                Circle()
+                    .fill(stateColor)
+                    .frame(width: 9, height: 9)
+                    .shadow(color: stateColor.opacity(0.75), radius: detector.isEnabled ? 5 : 0)
+                Text(detector.isEnabled ? detector.state.rawValue : "Off")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 7) {
+                Text("Low")
+                Slider(value: $detector.sensitivity, in: 0...1)
+                    .tint(.green)
+                    .accessibilityLabel("Noise detector sensitivity")
+                Text("High")
+                Button("Calibrate") { detector.recalibrate() }
+                    .buttonStyle(.borderless)
+                    .controlSize(.mini)
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .disabled(!detector.isEnabled)
+        }
+        .padding(10)
+        .background(.black.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+struct PrivacyNoiseView: View {
+    @ObservedObject var noise: PrivacyNoiseController
+
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack {
+                Label("Privacy Noise", systemImage: "waveform")
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                Spacer()
+                Text(noise.status)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack {
+                Picker("Noise type", selection: $noise.noiseType) {
+                    ForEach(PrivacyNoiseType.allCases) { type in
+                        Text(type.rawValue).tag(type)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(maxWidth: .infinity)
+
+                Picker("Timer", selection: $noise.timerMinutes) {
+                    Text("Continuous").tag(0)
+                    Text("15 min").tag(15)
+                    Text("30 min").tag(30)
+                    Text("60 min").tag(60)
+                }
+                .pickerStyle(.menu)
+                .frame(maxWidth: .infinity)
+                .disabled(noise.isPlaying)
+            }
+
+            HStack(spacing: 8) {
+                Image(systemName: "speaker.fill")
+                Slider(value: $noise.volume, in: 0.05...0.35)
+                    .tint(.green)
+                    .accessibilityLabel("Privacy noise level")
+                Text("\(Int(noise.volume * 100))%")
+                    .font(.caption.monospacedDigit())
+                    .frame(width: 31)
+            }
+
+            Button(action: noise.toggle) {
+                Label(noise.isPlaying ? "Stop Privacy Noise" : "Start Privacy Noise", systemImage: noise.isPlaying ? "stop.fill" : "play.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(noise.isPlaying ? .red : .green)
+        }
+        .padding(10)
+        .background(.black.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+struct BroadcastOutputView: View {
+    @ObservedObject var audio: AudioController
+
+    private var isMultiOutput: Bool {
+        audio.deviceName.localizedCaseInsensitiveContains("multi-output")
+    }
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(systemName: isMultiOutput ? "hifispeaker.2.fill" : "hifispeaker.fill")
+                .foregroundStyle(isMultiOutput ? .green : .secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Broadcast Output")
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                Text(audio.deviceName)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Button("Speaker Setup…") {
+                let url = URL(fileURLWithPath: "/System/Applications/Utilities/Audio MIDI Setup.app")
+                NSWorkspace.shared.open(url)
+            }
+            .controlSize(.small)
+        }
+        .padding(10)
+        .background(.black.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Broadcast output \(audio.deviceName)")
+    }
+}
+
 struct RotaryKnob: View {
     @ObservedObject var audio: AudioController
     @ObservedObject var analyzer: SpectrumAnalyzer
@@ -639,10 +1019,13 @@ struct VolumeControlView: View {
     @ObservedObject var audio: AudioController
     @ObservedObject var analyzer: SpectrumAnalyzer
     @ObservedObject var leveler: SmartLevelController
+    @ObservedObject var noise: PrivacyNoiseController
+    @ObservedObject var detector: SoundDetectorController
+    @State private var selectedPage = 0
     let closeWindow: () -> Void
 
     var body: some View {
-        VStack(spacing: 14) {
+        VStack(spacing: 11) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("VOLUME")
@@ -664,58 +1047,73 @@ struct VolumeControlView: View {
                 .accessibilityLabel("Hide volume knob")
             }
 
-            SpectrumView(analyzer: analyzer)
-
-            SmartLevelView(leveler: leveler)
-
-            RotaryKnob(audio: audio, analyzer: analyzer)
-                .frame(width: 154, height: 154)
-
-            HStack(spacing: 10) {
-                Button {
-                    audio.setVolume(audio.volume - 0.1)
-                } label: {
-                    Image(systemName: "speaker.minus.fill")
-                        .frame(width: 25, height: 25)
-                }
-                .buttonStyle(.borderless)
-                .accessibilityLabel("Volume down")
-
-                Slider(
-                    value: Binding(
-                        get: { Double(audio.volume) },
-                        set: { audio.setVolume(Float($0)) }
-                    ),
-                    in: 0...1
-                )
-                .tint(.green)
-                .accessibilityLabel("Volume level")
-
-                Button {
-                    audio.setVolume(audio.volume + 0.1)
-                } label: {
-                    Image(systemName: "speaker.plus.fill")
-                        .frame(width: 25, height: 25)
-                }
-                .buttonStyle(.borderless)
-                .accessibilityLabel("Volume up")
+            Picker("Mode", selection: $selectedPage) {
+                Label("Volume", systemImage: "speaker.wave.2.fill").tag(0)
+                Label("Privacy", systemImage: "shield.lefthalf.filled").tag(1)
             }
+            .pickerStyle(.segmented)
+            .labelsHidden()
 
-            Button(action: audio.toggleMute) {
-                Label(audio.isMuted ? "Unmute" : "Mute", systemImage: audio.isMuted ? "speaker.wave.2.fill" : "speaker.slash.fill")
-                    .font(.system(size: 16, weight: .semibold, design: .rounded))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
+            if selectedPage == 0 {
+                SpectrumView(analyzer: analyzer, detector: detector)
+                SmartLevelView(leveler: leveler)
+                RotaryKnob(audio: audio, analyzer: analyzer)
+                    .frame(width: 154, height: 154)
+
+                HStack(spacing: 10) {
+                    Button {
+                        audio.setVolume(audio.volume - 0.1)
+                    } label: {
+                        Image(systemName: "speaker.minus.fill")
+                            .frame(width: 25, height: 25)
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("Volume down")
+
+                    Slider(
+                        value: Binding(
+                            get: { Double(audio.volume) },
+                            set: { audio.setVolume(Float($0)) }
+                        ),
+                        in: 0...1
+                    )
+                    .tint(.green)
+                    .accessibilityLabel("Volume level")
+
+                    Button {
+                        audio.setVolume(audio.volume + 0.1)
+                    } label: {
+                        Image(systemName: "speaker.plus.fill")
+                            .frame(width: 25, height: 25)
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("Volume up")
+                }
+
+                Button(action: audio.toggleMute) {
+                    Label(audio.isMuted ? "Unmute" : "Mute", systemImage: audio.isMuted ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                        .font(.system(size: 16, weight: .semibold, design: .rounded))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 9)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(audio.isMuted ? .green : .red)
+
+                Text("Drag the knob up/down or left/right")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            } else {
+                SpectrumView(analyzer: analyzer, detector: detector)
+                NoiseDetectorView(detector: detector)
+                PrivacyNoiseView(noise: noise)
+                BroadcastOutputView(audio: audio)
+                Text("Local only · no recording · start external amplifiers low")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(audio.isMuted ? .green : .red)
-
-            Text("Drag the knob up/down or left/right")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
         }
         .padding(18)
-        .frame(width: 280, height: 530)
+        .frame(width: 300, height: 560, alignment: .top)
         .background(Color.black.opacity(0.22))
     }
 }
@@ -725,6 +1123,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let audio = AudioController()
     private let analyzer = SpectrumAnalyzer()
     private lazy var leveler = SmartLevelController(audio: audio, analyzer: analyzer)
+    private lazy var noise = PrivacyNoiseController()
+    private lazy var detector = SoundDetectorController(analyzer: analyzer, noise: noise)
     private var panel: NSPanel!
     private var statusItem: NSStatusItem!
 
@@ -737,7 +1137,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func createPanel() {
         panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 280, height: 530),
+            contentRect: NSRect(x: 0, y: 0, width: 300, height: 560),
             styleMask: [.titled, .closable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -754,7 +1154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.backgroundColor = .clear
         panel.delegate = self
         panel.setFrameAutosaveName("VolumeKnobPanel")
-        panel.contentView = NSHostingView(rootView: VolumeControlView(audio: audio, analyzer: analyzer, leveler: leveler) { [weak self] in
+        panel.contentView = NSHostingView(rootView: VolumeControlView(audio: audio, analyzer: analyzer, leveler: leveler, noise: noise, detector: detector) { [weak self] in
             self?.panel.orderOut(nil)
         })
         if !panel.setFrameUsingName("VolumeKnobPanel") {
