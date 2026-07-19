@@ -6,6 +6,10 @@ A small, native floating volume controller and live spectrum analyzer for macOS.
 ![Swift](https://img.shields.io/badge/Swift-6-orange)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
+## Support Volume Knob
+
+Volume Knob is free to download and use. If it helps you, please consider a **suggested $5 donation** through [Cash App — $DarwinGoble0000420](https://cash.app/$DarwinGoble0000420). Donations are optional and are not required to download or use the app.
+
 ## Features
 
 - Floating, always-on-top glass panel
