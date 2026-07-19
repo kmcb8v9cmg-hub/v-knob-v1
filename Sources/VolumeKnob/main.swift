@@ -19,6 +19,7 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
     @Published private(set) var bands = Array(repeating: Float(0.03), count: 24)
     @Published private(set) var level: Float = 0
     @Published private(set) var activeSource = "Starting…"
+    @Published private(set) var systemLoudnessDB: Float = -60
     @Published var selectedSource: SpectrumSource = .automatic {
         didSet { restart() }
     }
@@ -29,6 +30,10 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
     private var generation = 0
     private var lastSystemSignal = Date.distantPast
     private var smoothedBands = Array(repeating: Float(0.03), count: 24)
+
+    var hasRecentSystemSignal: Bool {
+        Date().timeIntervalSince(lastSystemSignal) < 1.5
+    }
 
     override init() {
         super.init()
@@ -191,7 +196,11 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
         guard generation == self.generation else { return }
         let rms = sqrt(samples.reduce(Float.zero) { $0 + $1 * $1 } / Float(max(samples.count, 1)))
 
-        if origin == .system, rms > 0.004 { lastSystemSignal = Date() }
+        if origin == .system, rms > 0.004 {
+            lastSystemSignal = Date()
+            let measuredDB = 20 * log10(max(rms, 0.000_001))
+            systemLoudnessDB += (measuredDB - systemLoudnessDB) * 0.035
+        }
         if selectedSource == .automatic {
             let useSystem = Date().timeIntervalSince(lastSystemSignal) < 1.25
             guard (origin == .system && useSystem) || (origin == .microphone && !useSystem) else { return }
@@ -428,6 +437,127 @@ final class AudioController: ObservableObject {
     }
 }
 
+@MainActor
+final class SmartLevelController: ObservableObject {
+    @Published var isEnabled = false {
+        didSet {
+            guard let audio, let analyzer else { return }
+            if isEnabled {
+                baseVolume = max(audio.volume, 0.05)
+                lastAppliedVolume = nil
+                if analyzer.selectedSource == .microphone {
+                    analyzer.selectedSource = .automatic
+                }
+                status = "Waiting for Mac Audio"
+            } else {
+                status = "Off"
+                lastAppliedVolume = nil
+            }
+        }
+    }
+    @Published var strength: Double = 0.48
+    @Published private(set) var status = "Off"
+
+    private weak var audio: AudioController?
+    private weak var analyzer: SpectrumAnalyzer?
+    private var timer: Timer?
+    private var baseVolume: Float = 0.5
+    private var lastAppliedVolume: Float?
+
+    init(audio: AudioController, analyzer: SpectrumAnalyzer) {
+        self.audio = audio
+        self.analyzer = analyzer
+        timer = Timer.scheduledTimer(withTimeInterval: 0.75, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.adjust() }
+        }
+    }
+
+    private func adjust() {
+        guard isEnabled, let audio, let analyzer else { return }
+        guard analyzer.hasRecentSystemSignal else {
+            status = "Waiting for Mac Audio"
+            lastAppliedVolume = nil
+            return
+        }
+        guard !audio.isMuted else {
+            status = "Paused while muted"
+            return
+        }
+
+        let current = audio.volume
+        if let lastAppliedVolume {
+            if abs(current - lastAppliedVolume) > 0.04 {
+                baseVolume = max(current, 0.05)
+            }
+        } else {
+            baseVolume = max(current, 0.05)
+        }
+
+        let targetDB: Float = -20
+        let errorDB = min(max(targetDB - analyzer.systemLoudnessDB, -8), 8)
+        let effectiveStrength = Float(0.20 + strength * 0.80)
+        let gain = pow(Float(10), (errorDB / 20) * effectiveStrength)
+        let lowerLimit = max(baseVolume * 0.55, 0.03)
+        let upperLimit = min(baseVolume * 1.50, 1)
+        let desired = min(max(baseVolume * gain, lowerLimit), upperLimit)
+        let stepLimit = Float(0.015 + strength * 0.025)
+        let change = min(max(desired - current, -stepLimit), stepLimit)
+
+        if abs(change) > 0.006 {
+            let next = current + change
+            audio.setVolume(next)
+            lastAppliedVolume = next
+        } else {
+            lastAppliedVolume = current
+        }
+
+        if errorDB < -1.25 {
+            status = "Taming a loud track"
+        } else if errorDB > 1.25 {
+            status = "Lifting a quiet track"
+        } else {
+            status = "Level steady"
+        }
+    }
+}
+
+struct SmartLevelView: View {
+    @ObservedObject var leveler: SmartLevelController
+
+    var body: some View {
+        VStack(spacing: 6) {
+            HStack {
+                Toggle(isOn: $leveler.isEnabled) {
+                    Label("Smart Level", systemImage: "waveform.badge.checkmark")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                .toggleStyle(.switch)
+                .tint(.green)
+                Spacer()
+                Text(leveler.status)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            HStack(spacing: 7) {
+                Text("Gentle")
+                Slider(value: $leveler.strength, in: 0...1)
+                    .tint(.green)
+                    .accessibilityLabel("Smart Level strength")
+                Text("Strong")
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .disabled(!leveler.isEnabled)
+            .opacity(leveler.isEnabled ? 1 : 0.42)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(.black.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
 struct RotaryKnob: View {
     @ObservedObject var audio: AudioController
     @ObservedObject var analyzer: SpectrumAnalyzer
@@ -508,6 +638,7 @@ struct RotaryKnob: View {
 struct VolumeControlView: View {
     @ObservedObject var audio: AudioController
     @ObservedObject var analyzer: SpectrumAnalyzer
+    @ObservedObject var leveler: SmartLevelController
     let closeWindow: () -> Void
 
     var body: some View {
@@ -535,8 +666,10 @@ struct VolumeControlView: View {
 
             SpectrumView(analyzer: analyzer)
 
+            SmartLevelView(leveler: leveler)
+
             RotaryKnob(audio: audio, analyzer: analyzer)
-                .frame(width: 164, height: 164)
+                .frame(width: 154, height: 154)
 
             HStack(spacing: 10) {
                 Button {
@@ -582,7 +715,7 @@ struct VolumeControlView: View {
                 .foregroundStyle(.tertiary)
         }
         .padding(18)
-        .frame(width: 270, height: 455)
+        .frame(width: 280, height: 530)
         .background(Color.black.opacity(0.22))
     }
 }
@@ -591,6 +724,7 @@ struct VolumeControlView: View {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let audio = AudioController()
     private let analyzer = SpectrumAnalyzer()
+    private lazy var leveler = SmartLevelController(audio: audio, analyzer: analyzer)
     private var panel: NSPanel!
     private var statusItem: NSStatusItem!
 
@@ -603,7 +737,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func createPanel() {
         panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 270, height: 455),
+            contentRect: NSRect(x: 0, y: 0, width: 280, height: 530),
             styleMask: [.titled, .closable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -620,7 +754,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.backgroundColor = .clear
         panel.delegate = self
         panel.setFrameAutosaveName("VolumeKnobPanel")
-        panel.contentView = NSHostingView(rootView: VolumeControlView(audio: audio, analyzer: analyzer) { [weak self] in
+        panel.contentView = NSHostingView(rootView: VolumeControlView(audio: audio, analyzer: analyzer, leveler: leveler) { [weak self] in
             self?.panel.orderOut(nil)
         })
         if !panel.setFrameUsingName("VolumeKnobPanel") {

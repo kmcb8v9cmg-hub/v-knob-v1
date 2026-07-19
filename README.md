@@ -17,6 +17,7 @@ A small, native floating volume controller and live spectrum analyzer for macOS.
 - Auto mode prefers Mac audio and falls back to the microphone when music stops
 - Dedicated Mac Audio and Microphone modes
 - Sound-reactive glow around the knob
+- Optional Smart Level with Gentle-to-Strong control for consistent track loudness
 - Bluetooth and external-speaker support
 - Menu-bar access
 - No accounts, analytics, network requests, or audio recording
@@ -61,6 +62,7 @@ To open Volume Knob automatically, add it under **System Settings â†’ General â†
 - Select **Mute** to silence output and **Unmute** to restore it.
 - Select the speaker icon in the menu bar for quick access.
 - Choose **Auto**, **Mac Audio**, or **Microphone** beside the spectrum. Auto switches to the microphone after Mac audio is quiet for about one second.
+- Turn on **Smart Level** to slowly balance louder and quieter recordings. Set the strength from **Gentle** to **Strong**. Smart Level responds only to Mac audio and pauses when music stops or output is muted.
 
 ## Project layout
 
