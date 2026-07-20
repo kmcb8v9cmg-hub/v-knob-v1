@@ -245,6 +245,8 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
     @Published private(set) var activeSource = "Starting…"
     @Published private(set) var systemLoudnessDB: Float = -60
     @Published private(set) var microphoneLevel: Float = 0
+    @Published private(set) var liveDBFS: Float = -60
+    @Published private(set) var peakDBFS: Float = -60
     @Published var selectedSource: SpectrumSource = .automatic {
         didSet { restart() }
     }
@@ -279,6 +281,8 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
         bands = Array(repeating: 0.03, count: 24)
         smoothedBands = bands
         level = 0
+        liveDBFS = -60
+        peakDBFS = -60
         lastMicrophoneSample = Date()
         lastDisplayedSample = Date()
 
@@ -429,6 +433,7 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
     private func accept(samples: [Float], origin: SpectrumSource, generation: Int) {
         guard generation == self.generation else { return }
         let rms = sqrt(samples.reduce(Float.zero) { $0 + $1 * $1 } / Float(max(samples.count, 1)))
+        let measuredDB = min(20 * log10(max(rms, 0.000_001)), 0)
 
         if origin == .microphone {
             lastMicrophoneSample = Date()
@@ -438,7 +443,6 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
 
         if origin == .system, rms > 0.004 {
             lastSystemSignal = Date()
-            let measuredDB = 20 * log10(max(rms, 0.000_001))
             systemLoudnessDB += (measuredDB - systemLoudnessDB) * 0.035
         }
         if selectedSource == .automatic {
@@ -450,6 +454,8 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
         }
 
         lastDisplayedSample = Date()
+        liveDBFS += (measuredDB - liveDBFS) * 0.32
+        peakDBFS = max(measuredDB, peakDBFS - 0.10)
 
         let newBands = Self.spectrum(samples: samples, bandCount: bands.count)
         for index in smoothedBands.indices {
@@ -470,6 +476,8 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
             }
             bands = smoothedBands
             level *= 0.78
+            liveDBFS += (-60 - liveDBFS) * 0.20
+            peakDBFS = max(liveDBFS, peakDBFS - 1.2)
         }
 
         guard selectedSource != .system,
@@ -529,25 +537,110 @@ struct SpectrumView: View {
         }
     }
 
+    private func bandColor(for value: Float) -> Color {
+        if value > 0.82 { return .red }
+        if value > 0.58 { return .yellow }
+        return alertColor
+    }
+
+    private func decibelText(_ value: Float) -> String {
+        "\(Int(max(value, -60).rounded()))"
+    }
+
     var body: some View {
         VStack(spacing: 5) {
-            HStack(alignment: .bottom, spacing: 2) {
-                ForEach(Array(analyzer.bands.enumerated()), id: \.offset) { index, value in
-                    Capsule()
-                        .fill(
-                            LinearGradient(
-                                colors: [alertColor.opacity(0.50), alertColor],
-                                startPoint: .bottom,
-                                endPoint: .top
-                            )
-                        )
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 5 + CGFloat(value) * 48)
-                        .shadow(color: alertColor.opacity(Double(value) * 0.65), radius: 4)
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(alertColor)
+                    .frame(width: 6, height: 6)
+                    .shadow(color: alertColor, radius: 4)
+                Text("LIVE SPECTRUM")
+                    .font(.system(size: 9, weight: .bold, design: .rounded))
+                Spacer()
+                Text("LEVEL \(decibelText(analyzer.liveDBFS)) dBFS")
+                    .foregroundStyle(alertColor)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(.black.opacity(0.30), in: Capsule())
+                Text("PEAK \(decibelText(analyzer.peakDBFS))")
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(.black.opacity(0.30), in: Capsule())
+            }
+            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+
+            HStack(alignment: .top, spacing: 5) {
+                VStack(spacing: 0) {
+                    Text("0")
+                    Spacer()
+                    Text("-30")
+                    Spacer()
+                    Text("-60")
+                }
+                .font(.system(size: 8, weight: .medium, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(width: 25, height: 62)
+
+                VStack(spacing: 2) {
+                    ZStack(alignment: .bottom) {
+                        VStack(spacing: 0) {
+                            Rectangle().frame(height: 0.6)
+                            Spacer()
+                            Rectangle().frame(height: 0.6)
+                            Spacer()
+                            Rectangle().frame(height: 0.6)
+                        }
+                        .foregroundStyle(.white.opacity(0.20))
+
+                        HStack(spacing: 0) {
+                            ForEach(0..<5, id: \.self) { index in
+                                Rectangle()
+                                    .fill(.white.opacity(index == 0 || index == 4 ? 0.18 : 0.10))
+                                    .frame(width: 0.6)
+                                if index < 4 { Spacer() }
+                            }
+                        }
+
+                        HStack(alignment: .bottom, spacing: 2) {
+                            ForEach(Array(analyzer.bands.enumerated()), id: \.offset) { _, value in
+                                let color = bandColor(for: value)
+                                Capsule()
+                                    .fill(
+                                        LinearGradient(
+                                            colors: [alertColor.opacity(0.42), color],
+                                            startPoint: .bottom,
+                                            endPoint: .top
+                                        )
+                                    )
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 3 + CGFloat(value) * 57)
+                                    .shadow(color: color.opacity(Double(value) * 0.82), radius: 4)
+                            }
+                        }
+                        .padding(.horizontal, 2)
+                        .opacity(detector.isEnabled && detector.state == .quiet ? 0.38 : 1)
+                        .animation(.linear(duration: 0.08), value: analyzer.bands)
+                    }
+                    .frame(height: 62, alignment: .bottom)
+                    .background(.black.opacity(0.20), in: RoundedRectangle(cornerRadius: 5))
+                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(.white.opacity(0.12), lineWidth: 1))
+
+                    HStack {
+                        Text("60")
+                        Spacer()
+                        Text("250")
+                        Spacer()
+                        Text("1k")
+                        Spacer()
+                        Text("4k")
+                        Spacer()
+                        Text("12k Hz")
+                    }
+                    .font(.system(size: 7, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.secondary)
                 }
             }
-            .frame(height: 54, alignment: .bottom)
-            .opacity(detector.isEnabled && detector.state == .quiet ? 0.38 : 1)
             .animation(.easeOut(duration: 0.12), value: detector.state)
 
             HStack {
@@ -1245,7 +1338,7 @@ struct VolumeControlView: View {
             }
         }
         .padding(18)
-        .frame(width: 300, height: 560, alignment: .top)
+        .frame(width: 330, height: 620, alignment: .top)
         .background(Color.black.opacity(0.42))
         .overlay {
             PulsingEdgeLight()
@@ -1329,7 +1422,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func createPanel() {
         panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 300, height: 560),
+            contentRect: NSRect(x: 0, y: 0, width: 330, height: 620),
             styleMask: [.titled, .closable, .fullSizeContentView],
             backing: .buffered,
             defer: false

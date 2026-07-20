@@ -19,7 +19,7 @@ Volume Knob is free to download and use. If it helps you, please consider a **su
 - Custom green volume slider with glowing red hash marks
 - Volume up and down buttons
 - Large mute/unmute button
-- Real-time 24-band green spectrum analyzer
+- Real-time 24-band spectrum analyzer with dBFS levels, peak hold, frequency scale, and signal-strength colors
 - Automatic analyzer decay and microphone reconnection if an input stalls
 - Auto mode prefers Mac audio and falls back to the microphone when music stops
 - Dedicated Mac Audio and Microphone modes
@@ -34,7 +34,7 @@ Volume Knob is free to download and use. If it helps you, please consider a **su
 - No accounts, analytics, network requests, or audio recording
 - Native SwiftUI and Core Audio implementation
 
-Version 3.2 analyzes audio locally only to draw the spectrum. Audio samples are never recorded, saved, or transmitted. macOS asks permission before Mac Audio or Microphone access is enabled.
+Version 3.3 analyzes audio locally only to draw the spectrum. Audio samples are never recorded, saved, or transmitted. macOS asks permission before Mac Audio or Microphone access is enabled.
 
 ## Requirements
 
