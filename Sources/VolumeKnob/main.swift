@@ -254,6 +254,10 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
     private var stream: SCStream?
     private var generation = 0
     private var lastSystemSignal = Date.distantPast
+    private var lastMicrophoneSample = Date.distantPast
+    private var lastDisplayedSample = Date.distantPast
+    private var lastMicrophoneRecovery = Date.distantPast
+    private var healthTimer: Timer?
     private var smoothedBands = Array(repeating: Float(0.03), count: 24)
 
     var hasRecentSystemSignal: Bool {
@@ -263,6 +267,9 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
     override init() {
         super.init()
         restart()
+        healthTimer = Timer.scheduledTimer(withTimeInterval: 0.20, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.monitorInputHealth() }
+        }
     }
 
     func restart() {
@@ -272,6 +279,8 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
         bands = Array(repeating: 0.03, count: 24)
         smoothedBands = bands
         level = 0
+        lastMicrophoneSample = Date()
+        lastDisplayedSample = Date()
 
         switch selectedSource {
         case .automatic:
@@ -422,6 +431,7 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
         let rms = sqrt(samples.reduce(Float.zero) { $0 + $1 * $1 } / Float(max(samples.count, 1)))
 
         if origin == .microphone {
+            lastMicrophoneSample = Date()
             let normalized = min(rms * 7.5, 1)
             microphoneLevel += (normalized - microphoneLevel) * 0.28
         }
@@ -439,6 +449,8 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
             return
         }
 
+        lastDisplayedSample = Date()
+
         let newBands = Self.spectrum(samples: samples, bandCount: bands.count)
         for index in smoothedBands.indices {
             let rising = newBands[index] > smoothedBands[index]
@@ -447,6 +459,27 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
         }
         bands = smoothedBands
         level += (min(rms * 8, 1) - level) * 0.35
+    }
+
+    private func monitorInputHealth() {
+        let now = Date()
+
+        if now.timeIntervalSince(lastDisplayedSample) > 0.45 {
+            for index in smoothedBands.indices {
+                smoothedBands[index] += (0.03 - smoothedBands[index]) * 0.24
+            }
+            bands = smoothedBands
+            level *= 0.78
+        }
+
+        guard selectedSource != .system,
+              AVCaptureDevice.authorizationStatus(for: .audio) == .authorized,
+              now.timeIntervalSince(lastMicrophoneSample) > 2.5,
+              now.timeIntervalSince(lastMicrophoneRecovery) > 3.0 else { return }
+
+        lastMicrophoneRecovery = now
+        activeSource = selectedSource == .automatic ? "Auto · Reconnecting microphone…" : "Reconnecting microphone…"
+        startMicrophone(generation: generation)
     }
 
     private nonisolated static func spectrum(samples: [Float], bandCount: Int) -> [Float] {
@@ -954,6 +987,82 @@ struct BroadcastOutputView: View {
     }
 }
 
+struct DialStyleVolumeSlider: View {
+    @ObservedObject var audio: AudioController
+
+    private var displayedVolume: CGFloat {
+        audio.isMuted ? 0 : CGFloat(audio.volume)
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            let inset: CGFloat = 9
+            let trackWidth = max(geometry.size.width - inset * 2, 1)
+            let thumbX = inset + trackWidth * displayedVolume
+
+            ZStack {
+                Capsule()
+                    .fill(Color.black.opacity(0.34))
+                    .overlay(Capsule().stroke(Color.white.opacity(0.12), lineWidth: 1))
+                    .frame(width: trackWidth, height: 7)
+                    .position(x: geometry.size.width / 2, y: geometry.size.height / 2)
+
+                Capsule()
+                    .fill(
+                        LinearGradient(
+                            colors: [Color.green.opacity(0.72), .green, Color(red: 0.28, green: 1.0, blue: 0.38)],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .frame(width: max(trackWidth * displayedVolume, 1), height: 7)
+                    .position(x: inset + max(trackWidth * displayedVolume, 1) / 2, y: geometry.size.height / 2)
+                    .shadow(color: .green.opacity(0.80), radius: 5)
+
+                ForEach(0..<21, id: \.self) { index in
+                    let tickFraction = CGFloat(index) / 20
+                    let isMajor = index % 5 == 0
+                    let isActive = !audio.isMuted && tickFraction <= displayedVolume
+                    Capsule()
+                        .fill(Color.red.opacity(isActive ? 1.0 : 0.28))
+                        .frame(width: isMajor ? 2.5 : 1.5, height: isMajor ? 15 : 10)
+                        .position(
+                            x: inset + trackWidth * tickFraction,
+                            y: geometry.size.height / 2
+                        )
+                        .shadow(color: .red.opacity(isActive ? 0.95 : 0.18), radius: isActive ? 4 : 1)
+                }
+
+                Circle()
+                    .fill(audio.isMuted ? Color.gray : Color.white)
+                    .overlay(Circle().stroke(audio.isMuted ? Color.gray : Color.green, lineWidth: 3))
+                    .frame(width: 19, height: 19)
+                    .position(x: thumbX, y: geometry.size.height / 2)
+                    .shadow(color: audio.isMuted ? .clear : .green.opacity(0.90), radius: 6)
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { gesture in
+                        let fraction = min(max((gesture.location.x - inset) / trackWidth, 0), 1)
+                        audio.setVolume(Float(fraction))
+                    }
+            )
+        }
+        .frame(height: 30)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Volume level")
+        .accessibilityValue("\(Int(audio.volume * 100)) percent")
+        .accessibilityAdjustableAction { direction in
+            switch direction {
+            case .increment: audio.setVolume(audio.volume + 0.05)
+            case .decrement: audio.setVolume(audio.volume - 0.05)
+            @unknown default: break
+            }
+        }
+    }
+}
+
 struct RotaryKnob: View {
     @ObservedObject var audio: AudioController
     @ObservedObject var analyzer: SpectrumAnalyzer
@@ -1101,15 +1210,7 @@ struct VolumeControlView: View {
                     .buttonStyle(.borderless)
                     .accessibilityLabel("Volume down")
 
-                    Slider(
-                        value: Binding(
-                            get: { Double(audio.volume) },
-                            set: { audio.setVolume(Float($0)) }
-                        ),
-                        in: 0...1
-                    )
-                    .tint(.green)
-                    .accessibilityLabel("Volume level")
+                    DialStyleVolumeSlider(audio: audio)
 
                     Button {
                         audio.setVolume(audio.volume + 0.1)
@@ -1146,6 +1247,66 @@ struct VolumeControlView: View {
         .padding(18)
         .frame(width: 300, height: 560, alignment: .top)
         .background(Color.black.opacity(0.42))
+        .overlay {
+            PulsingEdgeLight()
+                .allowsHitTesting(false)
+        }
+    }
+}
+
+private struct PulsingEdgeLight: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isGlowing = false
+    @State private var colorShift = false
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 17, style: .continuous)
+                .stroke(Color.blue, lineWidth: isGlowing ? 10 : 7)
+                .opacity(isGlowing ? 0.48 : 0.20)
+                .blur(radius: 6)
+
+            RoundedRectangle(cornerRadius: 17, style: .continuous)
+                .stroke(
+                    AngularGradient(
+                        colors: [
+                            Color(red: 0.00, green: 0.20, blue: 1.00),
+                            .cyan,
+                            .white,
+                            Color(red: 0.08, green: 0.46, blue: 1.00),
+                            Color(red: 0.44, green: 0.08, blue: 1.00),
+                            Color(red: 0.78, green: 0.12, blue: 1.00),
+                            .blue,
+                            .cyan,
+                            Color(red: 0.00, green: 0.20, blue: 1.00)
+                        ],
+                        center: .center
+                    ),
+                    lineWidth: isGlowing ? 4.0 : 2.4
+                )
+                .hueRotation(colorShift ? .degrees(360) : .zero)
+                .shadow(color: .cyan.opacity(isGlowing ? 0.95 : 0.50), radius: isGlowing ? 8 : 3)
+
+            RoundedRectangle(cornerRadius: 15, style: .continuous)
+                .stroke(Color.white.opacity(isGlowing ? 0.78 : 0.32), lineWidth: 0.9)
+                .padding(3)
+        }
+        .saturation(1.65)
+        .brightness(isGlowing ? 0.18 : 0.06)
+        .blendMode(.screen)
+        .padding(3)
+        .onAppear {
+            guard !reduceMotion else {
+                isGlowing = true
+                return
+            }
+            withAnimation(.easeInOut(duration: 1.15).repeatForever(autoreverses: true)) {
+                isGlowing = true
+            }
+            withAnimation(.linear(duration: 6.5).repeatForever(autoreverses: false)) {
+                colorShift = true
+            }
+        }
     }
 }
 

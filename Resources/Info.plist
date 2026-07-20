@@ -15,9 +15,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>3.1</string>
+	<string>3.2</string>
 	<key>CFBundleVersion</key>
-	<string>10</string>
+	<string>11</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Volume Knob uses the microphone only to animate its live spectrum when microphone mode is active.</string>
 	<key>NSScreenCaptureUsageDescription</key>

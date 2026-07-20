@@ -13,12 +13,14 @@ Volume Knob is free to download and use. If it helps you, please consider a **su
 ## Features
 
 - Floating, always-on-top glass panel
+- Brilliant blue, cyan, violet, and white edge light with a smooth pulse
 - Rotary drag and click control
 - Glowing red volume hash marks surrounding the green dial ring
-- Standard volume slider
+- Custom green volume slider with glowing red hash marks
 - Volume up and down buttons
 - Large mute/unmute button
 - Real-time 24-band green spectrum analyzer
+- Automatic analyzer decay and microphone reconnection if an input stalls
 - Auto mode prefers Mac audio and falls back to the microphone when music stops
 - Dedicated Mac Audio and Microphone modes
 - Sound-reactive glow around the knob
@@ -32,7 +34,7 @@ Volume Knob is free to download and use. If it helps you, please consider a **su
 - No accounts, analytics, network requests, or audio recording
 - Native SwiftUI and Core Audio implementation
 
-Version 2 analyzes audio locally only to draw the spectrum. Audio samples are never recorded, saved, or transmitted. macOS asks permission before Mac Audio or Microphone access is enabled.
+Version 3.2 analyzes audio locally only to draw the spectrum. Audio samples are never recorded, saved, or transmitted. macOS asks permission before Mac Audio or Microphone access is enabled.
 
 ## Requirements
 
@@ -66,7 +68,7 @@ To open Volume Knob automatically, add it under **System Settings â†’ General â†
 
 - Drag the knob up/right to increase volume or down/left to decrease it.
 - Click around the knob to jump to a level.
-- Drag the green slider for precise control.
+- Drag the illuminated green-and-red slider for precise control.
 - Use the speaker-minus and speaker-plus buttons for 10% steps.
 - Select **Mute** to silence output and **Unmute** to restore it.
 - Select the speaker icon in the menu bar for quick access.
