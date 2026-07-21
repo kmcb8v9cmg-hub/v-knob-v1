@@ -4,7 +4,351 @@ import Combine
 import CoreAudio
 import AVFoundation
 import Accelerate
+import ApplicationServices
 @preconcurrency import ScreenCaptureKit
+
+enum MediaCaptureMode: String, CaseIterable, Identifiable {
+    case screenshot = "PNG"
+    case video = "MP4"
+    var id: String { rawValue }
+}
+
+enum MediaKey: Int32 {
+    case playPause = 16
+    case next = 17
+    case previous = 18
+}
+
+enum SystemMediaController {
+    static func send(_ key: MediaKey) {
+        post(key, state: 0xA)
+        post(key, state: 0xB)
+    }
+
+    private static func post(_ key: MediaKey, state: Int32) {
+        let data = (key.rawValue << 16) | (state << 8)
+        let event = NSEvent.otherEvent(
+            with: .systemDefined,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: 0,
+            context: nil,
+            subtype: 8,
+            data1: Int(data),
+            data2: -1
+        )
+        event?.cgEvent?.post(tap: .cghidEventTap)
+    }
+}
+
+@MainActor
+final class NowPlayingController: ObservableObject {
+    @Published private(set) var current = "Nothing playing"
+    @Published private(set) var upNext = "Queue unavailable"
+    @Published private(set) var source = ""
+
+    private var timer: Timer?
+    private var isActive = true
+
+    init() {
+        refresh()
+        startTimer()
+    }
+
+    func suspend() {
+        isActive = false
+        timer?.invalidate()
+        timer = nil
+    }
+
+    func resume() {
+        guard !isActive else { return }
+        isActive = true
+        refresh()
+        startTimer()
+    }
+
+    private func startTimer() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refresh() }
+        }
+    }
+
+    func send(_ key: MediaKey) {
+        let command: String
+        switch key {
+        case .playPause: command = "playpause"
+        case .next: command = "next track"
+        case .previous: command = "previous track"
+        }
+
+        let target: String?
+        if source == "Music" {
+            target = "Music"
+        } else if source == "Spotify" {
+            target = "Spotify"
+        } else {
+            target = nil
+        }
+
+        if let target {
+            var error: NSDictionary?
+            let script = NSAppleScript(source: "tell application \"\(target)\" to \(command)")
+            script?.executeAndReturnError(&error)
+            if error == nil {
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: .milliseconds(250))
+                    self?.refresh()
+                }
+                return
+            }
+        }
+
+        SystemMediaController.send(key)
+    }
+
+    private func refresh() {
+        guard isActive else { return }
+        let running = NSWorkspace.shared.runningApplications
+        if running.contains(where: { $0.bundleIdentifier == "com.apple.Music" }),
+           let fields = runMusicScript(), !fields.isEmpty {
+            updateMetadata(
+                current: track(fields[safe: 0], artist: fields[safe: 1]),
+                upNext: track(fields[safe: 2], artist: fields[safe: 3], fallback: "End of queue"),
+                source: "Music"
+            )
+            return
+        }
+
+        if running.contains(where: { $0.bundleIdentifier == "com.spotify.client" }),
+           let fields = runSpotifyScript(), !fields.isEmpty {
+            updateMetadata(
+                current: track(fields[safe: 0], artist: fields[safe: 1]),
+                upNext: "Open Spotify to view its queue",
+                source: "Spotify"
+            )
+            return
+        }
+
+        updateMetadata(current: "Nothing playing", upNext: "Queue unavailable", source: "")
+    }
+
+    private func updateMetadata(current: String, upNext: String, source: String) {
+        if self.current != current { self.current = current }
+        if self.upNext != upNext { self.upNext = upNext }
+        if self.source != source { self.source = source }
+    }
+
+    private func runMusicScript() -> [String]? {
+        runAppleScript("""
+        tell application "Music"
+            if player state is stopped then return ""
+            set currentTitle to name of current track
+            set currentArtist to artist of current track
+            set nextTitle to ""
+            set nextArtist to ""
+            try
+                set nextIndex to (index of current track) + 1
+                set nextTrack to some track of current playlist whose index is nextIndex
+                set nextTitle to name of nextTrack
+                set nextArtist to artist of nextTrack
+            end try
+            return currentTitle & "|||" & currentArtist & "|||" & nextTitle & "|||" & nextArtist
+        end tell
+        """)
+    }
+
+    private func runSpotifyScript() -> [String]? {
+        runAppleScript("""
+        tell application "Spotify"
+            if player state is stopped then return ""
+            return (name of current track) & "|||" & (artist of current track)
+        end tell
+        """)
+    }
+
+    private func runAppleScript(_ source: String) -> [String]? {
+        var error: NSDictionary?
+        guard let script = NSAppleScript(source: source) else { return nil }
+        let result = script.executeAndReturnError(&error)
+        guard error == nil else { return nil }
+        let value = result.stringValue ?? ""
+        guard !value.isEmpty else { return nil }
+        return value.components(separatedBy: "|||")
+    }
+
+    private func track(_ title: String?, artist: String?, fallback: String = "Nothing playing") -> String {
+        guard let title, !title.isEmpty else { return fallback }
+        guard let artist, !artist.isEmpty else { return title }
+        return "\(title) — \(artist)"
+    }
+}
+
+private extension Collection {
+    subscript(safe index: Index) -> Element? {
+        indices.contains(index) ? self[index] : nil
+    }
+}
+
+@MainActor
+final class MediaCaptureController: ObservableObject {
+    @Published var mode: MediaCaptureMode = .screenshot
+    @Published private(set) var outputFolder: URL
+    @Published private(set) var isCapturing = false
+    @Published private(set) var status = "Ready"
+    @Published private(set) var elapsed = "00:00"
+    @Published private(set) var fileSize = "0 MB"
+    @Published private(set) var lastCapture: URL?
+
+    private var process: Process?
+    private var timer: Timer?
+    private var startedAt: Date?
+    private var workingURL: URL?
+
+    init() {
+        let movies = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first!
+        outputFolder = movies.appendingPathComponent("Volume Knob", isDirectory: true)
+        try? FileManager.default.createDirectory(at: outputFolder, withIntermediateDirectories: true)
+    }
+
+    func chooseOutputFolder() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose a USB drive or capture folder"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            outputFolder = url
+            status = "Output folder selected"
+        }
+    }
+
+    func selectAndCapture() {
+        guard !isCapturing else { return }
+        try? FileManager.default.createDirectory(at: outputFolder, withIntermediateDirectories: true)
+        let stamp = Self.timestamp()
+        let url = outputFolder.appendingPathComponent(
+            mode == .screenshot ? "capture_\(stamp).png" : "recording_\(stamp).mov"
+        )
+        workingURL = url
+
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        task.arguments = mode == .screenshot
+            ? ["-i", "-s", "-x", url.path]
+            : ["-v", "-i", "-J", "video", "-x", url.path]
+        task.terminationHandler = { [weak self] finished in
+            Task { @MainActor [weak self] in
+                self?.captureFinished(exitCode: finished.terminationStatus)
+            }
+        }
+
+        do {
+            try task.run()
+            process = task
+            isCapturing = true
+            startedAt = Date()
+            status = mode == .screenshot
+                ? "Drag a box on screen · Esc cancels"
+                : "Choose an area, then use Stop here or in the menu bar"
+            startTimer()
+        } catch {
+            status = "Capture could not start"
+        }
+    }
+
+    func stop() {
+        guard let process else { return }
+        status = "Finalizing…"
+        process.interrupt()
+    }
+
+    func cancel() {
+        guard let process else { return }
+        process.terminate()
+        if let workingURL { try? FileManager.default.removeItem(at: workingURL) }
+        status = "Cancelled"
+    }
+
+    func openLastCapture() {
+        guard let lastCapture else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([lastCapture])
+    }
+
+    func openScreenRecordingSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func startTimer() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refreshStats() }
+        }
+    }
+
+    private func refreshStats() {
+        if let startedAt {
+            let seconds = max(Int(Date().timeIntervalSince(startedAt)), 0)
+            elapsed = String(format: "%02d:%02d", seconds / 60, seconds % 60)
+        }
+        guard let workingURL,
+              let bytes = try? FileManager.default.attributesOfItem(atPath: workingURL.path)[.size] as? NSNumber else { return }
+        fileSize = ByteCountFormatter.string(fromByteCount: bytes.int64Value, countStyle: .file)
+    }
+
+    private func captureFinished(exitCode: Int32) {
+        timer?.invalidate()
+        timer = nil
+        process = nil
+        isCapturing = false
+        refreshStats()
+        guard exitCode == 0, let url = workingURL, FileManager.default.fileExists(atPath: url.path) else {
+            status = status == "Cancelled" ? status : "Cancelled or permission denied"
+            return
+        }
+
+        if mode == .video {
+            status = "Converting to MP4…"
+            Task { await convertVideoToMP4(url) }
+        } else {
+            lastCapture = url
+            status = "PNG saved"
+        }
+    }
+
+    private func convertVideoToMP4(_ source: URL) async {
+        let destination = source.deletingPathExtension().appendingPathExtension("mp4")
+        try? FileManager.default.removeItem(at: destination)
+        let asset = AVURLAsset(url: source)
+        guard let exporter = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
+            lastCapture = source
+            status = "Video saved as MOV"
+            return
+        }
+        do {
+            try await exporter.export(to: destination, as: .mp4)
+            try? FileManager.default.removeItem(at: source)
+            lastCapture = destination
+            workingURL = destination
+            refreshStats()
+            status = "MP4 saved"
+        } catch {
+            lastCapture = source
+            status = "Video saved as MOV · MP4 conversion unavailable"
+        }
+    }
+
+    private static func timestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        return formatter.string(from: Date())
+    }
+}
 
 enum SpectrumSource: String, CaseIterable, Identifiable {
     case automatic = "Auto"
@@ -238,6 +582,40 @@ final class SoundDetectorController: ObservableObject {
     }
 }
 
+private final class AudioSampleGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastMicrophoneSample = 0.0
+    private var lastSystemSample = 0.0
+
+    func shouldProcess(_ source: SpectrumSource) -> Bool {
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        defer { lock.unlock() }
+
+        switch source {
+        case .microphone:
+            guard now - lastMicrophoneSample >= 0.05 else { return false }
+            lastMicrophoneSample = now
+        case .system:
+            guard now - lastSystemSample >= 0.05 else { return false }
+            lastSystemSample = now
+        case .automatic:
+            return false
+        }
+        return true
+    }
+}
+
+private final class SpectrumDFT: @unchecked Sendable {
+    let setup = vDSP_DFT_zrop_CreateSetup(nil, 1024, vDSP_DFT_Direction.FORWARD)
+
+    deinit {
+        if let setup {
+            vDSP_DFT_DestroySetup(setup)
+        }
+    }
+}
+
 @MainActor
 final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     @Published private(set) var bands = Array(repeating: Float(0.03), count: 24)
@@ -253,14 +631,20 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
 
     private let engine = AVAudioEngine()
     private let systemQueue = DispatchQueue(label: "VolumeKnob.SystemAudio")
+    nonisolated private let sampleGate = AudioSampleGate()
     private var stream: SCStream?
     private var generation = 0
+    private var isSuspended = false
     private var lastSystemSignal = Date.distantPast
     private var lastMicrophoneSample = Date.distantPast
     private var lastDisplayedSample = Date.distantPast
     private var lastMicrophoneRecovery = Date.distantPast
+    private var lastMicrophoneMeterUpdate = Date.distantPast
+    private var lastSystemMeterUpdate = Date.distantPast
+    private var lastAnalysisUpdate = Date.distantPast
     private var healthTimer: Timer?
     private var smoothedBands = Array(repeating: Float(0.03), count: 24)
+    private let spectrumDFT = SpectrumDFT()
 
     var hasRecentSystemSignal: Bool {
         Date().timeIntervalSince(lastSystemSignal) < 1.5
@@ -275,6 +659,7 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
     }
 
     func restart() {
+        guard !isSuspended else { return }
         generation += 1
         let currentGeneration = generation
         stopSources()
@@ -309,6 +694,20 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
         stream = nil
     }
 
+    func suspend() {
+        guard !isSuspended else { return }
+        isSuspended = true
+        generation += 1
+        stopSources()
+        activeSource = "Paused while hidden"
+    }
+
+    func resume() {
+        guard isSuspended else { return }
+        isSuspended = false
+        restart()
+    }
+
     private func startMicrophone(generation: Int) {
         AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
             guard granted else {
@@ -329,7 +728,13 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
                 }
 
                 input.removeTap(onBus: 0)
-                Self.installMicrophoneTap(on: input, format: format, analyzer: self, generation: generation)
+                Self.installMicrophoneTap(
+                    on: input,
+                    format: format,
+                    analyzer: self,
+                    gate: self.sampleGate,
+                    generation: generation
+                )
 
                 do {
                     self.engine.prepare()
@@ -346,9 +751,11 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
         on input: AVAudioInputNode,
         format: AVAudioFormat,
         analyzer: SpectrumAnalyzer,
+        gate: AudioSampleGate,
         generation: Int
     ) {
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak analyzer] buffer, _ in
+            guard gate.shouldProcess(.microphone) else { return }
             guard let data = buffer.floatChannelData else { return }
             let count = min(Int(buffer.frameLength), 1024)
             let samples = Array(UnsafeBufferPointer(start: data[0], count: count))
@@ -389,6 +796,7 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
 
     nonisolated func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
         guard outputType == .audio,
+              sampleGate.shouldProcess(.system),
               CMSampleBufferDataIsReady(sampleBuffer),
               let block = CMSampleBufferGetDataBuffer(sampleBuffer),
               let format = CMSampleBufferGetFormatDescription(sampleBuffer),
@@ -432,32 +840,42 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
 
     private func accept(samples: [Float], origin: SpectrumSource, generation: Int) {
         guard generation == self.generation else { return }
+        let now = Date()
         let rms = sqrt(samples.reduce(Float.zero) { $0 + $1 * $1 } / Float(max(samples.count, 1)))
         let measuredDB = min(20 * log10(max(rms, 0.000_001)), 0)
 
         if origin == .microphone {
-            lastMicrophoneSample = Date()
-            let normalized = min(rms * 7.5, 1)
-            microphoneLevel += (normalized - microphoneLevel) * 0.28
+            lastMicrophoneSample = now
+            if now.timeIntervalSince(lastMicrophoneMeterUpdate) >= 0.05 {
+                lastMicrophoneMeterUpdate = now
+                let normalized = min(rms * 7.5, 1)
+                microphoneLevel += (normalized - microphoneLevel) * 0.28
+            }
         }
 
         if origin == .system, rms > 0.004 {
-            lastSystemSignal = Date()
-            systemLoudnessDB += (measuredDB - systemLoudnessDB) * 0.035
+            lastSystemSignal = now
+            if now.timeIntervalSince(lastSystemMeterUpdate) >= 0.05 {
+                lastSystemMeterUpdate = now
+                systemLoudnessDB += (measuredDB - systemLoudnessDB) * 0.18
+            }
         }
         if selectedSource == .automatic {
-            let useSystem = Date().timeIntervalSince(lastSystemSignal) < 1.25
+            let useSystem = now.timeIntervalSince(lastSystemSignal) < 1.25
             guard (origin == .system && useSystem) || (origin == .microphone && !useSystem) else { return }
-            activeSource = useSystem ? "Auto · Mac Audio" : "Auto · Microphone"
+            let sourceLabel = useSystem ? "Auto · Mac Audio" : "Auto · Microphone"
+            if activeSource != sourceLabel { activeSource = sourceLabel }
         } else if selectedSource != origin {
             return
         }
 
-        lastDisplayedSample = Date()
+        lastDisplayedSample = now
+        guard now.timeIntervalSince(lastAnalysisUpdate) >= 0.05 else { return }
+        lastAnalysisUpdate = now
         liveDBFS += (measuredDB - liveDBFS) * 0.32
         peakDBFS = max(measuredDB, peakDBFS - 0.10)
 
-        let newBands = Self.spectrum(samples: samples, bandCount: bands.count)
+        let newBands = spectrum(samples: samples, bandCount: bands.count)
         for index in smoothedBands.indices {
             let rising = newBands[index] > smoothedBands[index]
             let blend: Float = rising ? 0.62 : 0.18
@@ -468,6 +886,7 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
     }
 
     private func monitorInputHealth() {
+        guard !isSuspended else { return }
         let now = Date()
 
         if now.timeIntervalSince(lastDisplayedSample) > 0.45 {
@@ -490,7 +909,7 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
         startMicrophone(generation: generation)
     }
 
-    private nonisolated static func spectrum(samples: [Float], bandCount: Int) -> [Float] {
+    private func spectrum(samples: [Float], bandCount: Int) -> [Float] {
         let size = 1024
         var input = Array(samples.prefix(size))
         if input.count < size { input += Array(repeating: 0, count: size - input.count) }
@@ -503,11 +922,10 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
         var imaginary = [Float](repeating: 0, count: size)
         var outputReal = [Float](repeating: 0, count: size)
         var outputImaginary = [Float](repeating: 0, count: size)
-        guard let setup = vDSP_DFT_zrop_CreateSetup(nil, vDSP_Length(size), vDSP_DFT_Direction.FORWARD) else {
+        guard let spectrumSetup = spectrumDFT.setup else {
             return Array(repeating: 0.03, count: bandCount)
         }
-        defer { vDSP_DFT_DestroySetup(setup) }
-        vDSP_DFT_Execute(setup, &real, &imaginary, &outputReal, &outputImaginary)
+        vDSP_DFT_Execute(spectrumSetup, &real, &imaginary, &outputReal, &outputImaginary)
 
         let magnitudes = (0..<(size / 2)).map { index in
             hypot(outputReal[index], outputImaginary[index])
@@ -519,7 +937,10 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
             let start = max(1, Int(pow(fraction0, 2.15) * Float(magnitudes.count - 1)))
             let end = max(start + 1, Int(pow(fraction1, 2.15) * Float(magnitudes.count - 1)))
             let peak = magnitudes[start..<min(end, magnitudes.count)].max() ?? 0
-            return min(max(log10(1 + peak * 45) / 2.1, 0.025), 1)
+            let amplitude = peak * (2 / Float(size))
+            let decibels = 20 * log10(max(amplitude, 0.000_001)) - 30
+            let normalized = (decibels + 60) / 60
+            return min(max(pow(normalized, 0.90), 0.025), 0.92)
         }
     }
 }
@@ -675,7 +1096,7 @@ final class AudioController: ObservableObject {
 
     init() {
         refresh()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
     }
@@ -684,23 +1105,15 @@ final class AudioController: ObservableObject {
         let clamped = min(max(newValue, 0), 1)
         let percent = Int((clamped * 100).rounded())
 
-        if runSystemVolumeScript("set volume output volume \(percent)\nset volume output muted false") {
+        if let device = defaultOutputDevice(), setHardwareVolume(clamped, on: device) {
             volume = clamped
             isMuted = false
             return
         }
 
-        guard let device = defaultOutputDevice() else { return }
-        var value = clamped
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyVolumeScalar,
-            mScope: kAudioDevicePropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        let status = AudioObjectSetPropertyData(device, &address, 0, nil, UInt32(MemoryLayout<Float32>.size), &value)
-        if status == noErr {
+        if runSystemVolumeScript("set volume output volume \(percent)\nset volume output muted false") {
             volume = clamped
-            if clamped > 0, isMuted { setMuted(false) }
+            isMuted = false
         }
     }
 
@@ -709,25 +1122,15 @@ final class AudioController: ObservableObject {
     }
 
     func setMuted(_ muted: Bool) {
-        let muteSetting = muted ? "true" : "false"
-        if runSystemVolumeScript("set volume output muted " + muteSetting) {
+        if let device = defaultOutputDevice(), setHardwareMute(muted, on: device) {
             isMuted = muted
             return
         }
 
-        guard let device = defaultOutputDevice() else { return }
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyMute,
-            mScope: kAudioDevicePropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMain
-        )
-
-        if AudioObjectHasProperty(device, &address) {
-            var value: UInt32 = muted ? 1 : 0
-            if AudioObjectSetPropertyData(device, &address, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value) == noErr {
-                isMuted = muted
-                return
-            }
+        let muteSetting = muted ? "true" : "false"
+        if runSystemVolumeScript("set volume output muted " + muteSetting) {
+            isMuted = muted
+            return
         }
 
         if muted {
@@ -743,35 +1146,15 @@ final class AudioController: ObservableObject {
     func refresh() {
         guard let device = defaultOutputDevice() else { return }
 
-        if let settings = readSystemVolumeSettings() {
-            volume = settings.volume
-            isMuted = settings.muted
-        } else {
-            var volumeAddress = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyVolumeScalar,
-                mScope: kAudioDevicePropertyScopeOutput,
-                mElement: kAudioObjectPropertyElementMain
-            )
-            var newVolume: Float32 = volume
-            var volumeSize = UInt32(MemoryLayout<Float32>.size)
-            if AudioObjectGetPropertyData(device, &volumeAddress, 0, nil, &volumeSize, &newVolume) == noErr {
-                volume = newVolume
-            }
+        let hardwareVolume = readHardwareVolume(from: device)
+        let hardwareMute = readHardwareMute(from: device)
+        if let hardwareVolume { volume = hardwareVolume }
+        if let hardwareMute { isMuted = hardwareMute }
 
-            var muteAddress = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyMute,
-                mScope: kAudioDevicePropertyScopeOutput,
-                mElement: kAudioObjectPropertyElementMain
-            )
-            if AudioObjectHasProperty(device, &muteAddress) {
-                var muteValue: UInt32 = 0
-                var muteSize = UInt32(MemoryLayout<UInt32>.size)
-                if AudioObjectGetPropertyData(device, &muteAddress, 0, nil, &muteSize, &muteValue) == noErr {
-                    isMuted = muteValue != 0
-                }
-            } else {
-                isMuted = volume <= 0.001
-            }
+        if hardwareVolume == nil || hardwareMute == nil,
+           let settings = readSystemVolumeSettings() {
+            if hardwareVolume == nil { volume = settings.volume }
+            if hardwareMute == nil { isMuted = settings.muted }
         }
 
         deviceName = outputDeviceName(device) ?? "Mac Audio"
@@ -787,6 +1170,58 @@ final class AudioController: ObservableObject {
         )
         let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device)
         return status == noErr && device != 0 ? device : nil
+    }
+
+    private func setHardwareVolume(_ newValue: Float, on device: AudioDeviceID) -> Bool {
+        var value = newValue
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectHasProperty(device, &address) else { return false }
+        var settable = DarwinBoolean(false)
+        guard AudioObjectIsPropertySettable(device, &address, &settable) == noErr, settable.boolValue else { return false }
+        return AudioObjectSetPropertyData(device, &address, 0, nil, UInt32(MemoryLayout<Float32>.size), &value) == noErr
+    }
+
+    private func setHardwareMute(_ muted: Bool, on device: AudioDeviceID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectHasProperty(device, &address) else { return false }
+        var settable = DarwinBoolean(false)
+        guard AudioObjectIsPropertySettable(device, &address, &settable) == noErr, settable.boolValue else { return false }
+        var value: UInt32 = muted ? 1 : 0
+        return AudioObjectSetPropertyData(device, &address, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value) == noErr
+    }
+
+    private func readHardwareVolume(from device: AudioDeviceID) -> Float? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectHasProperty(device, &address) else { return nil }
+        var value: Float32 = 0
+        var size = UInt32(MemoryLayout<Float32>.size)
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &value) == noErr else { return nil }
+        return min(max(value, 0), 1)
+    }
+
+    private func readHardwareMute(from device: AudioDeviceID) -> Bool? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectHasProperty(device, &address) else { return nil }
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &value) == noErr else { return nil }
+        return value != 0
     }
 
     private func runSystemVolumeScript(_ source: String) -> Bool {
@@ -905,6 +1340,160 @@ final class SmartLevelController: ObservableObject {
     }
 }
 
+@MainActor
+final class GraphicEqualizerController: ObservableObject {
+    static let frequencies = ["31", "62", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"]
+
+    @Published var isEnabled: Bool {
+        didSet {
+            defaults.set(isEnabled, forKey: enabledKey)
+            scheduleApply()
+        }
+    }
+    @Published var gains: [Double] {
+        didSet {
+            defaults.set(gains, forKey: gainsKey)
+            scheduleApply()
+        }
+    }
+    @Published private(set) var status = "Off"
+
+    private let defaults = UserDefaults.standard
+    private let enabledKey = "GraphicEqualizerEnabled"
+    private let gainsKey = "GraphicEqualizerGains"
+    private var pendingApply: Task<Void, Never>?
+
+    init() {
+        isEnabled = defaults.bool(forKey: enabledKey)
+        if let saved = defaults.array(forKey: gainsKey) as? [Double],
+           saved.count == Self.frequencies.count {
+            gains = saved
+        } else {
+            gains = Array(repeating: 0, count: Self.frequencies.count)
+        }
+        scheduleApply()
+    }
+
+    func binding(for index: Int) -> Binding<Double> {
+        Binding(
+            get: { self.gains[index] },
+            set: { self.gains[index] = $0 }
+        )
+    }
+
+    func reset() {
+        gains = Array(repeating: 0, count: Self.frequencies.count)
+    }
+
+    private func scheduleApply() {
+        pendingApply?.cancel()
+        pendingApply = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled, let self else { return }
+            self.applyToMusic()
+        }
+    }
+
+    private func applyToMusic() {
+        guard let music = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == "com.apple.Music" }) else {
+            status = isEnabled ? "Open Music" : "Off"
+            return
+        }
+
+        if isEnabled, !AXIsProcessTrusted() {
+            let prompt = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+            AXIsProcessTrustedWithOptions(prompt)
+            status = "Allow Accessibility"
+            return
+        }
+
+        guard AXIsProcessTrusted() else {
+            status = "Off"
+            return
+        }
+
+        status = MusicEqualizerBridge.apply(pid: music.processIdentifier, enabled: isEnabled, gains: gains)
+            ? (isEnabled ? "On · Music" : "Off")
+            : "Music EQ unavailable"
+    }
+}
+
+private enum MusicEqualizerBridge {
+    @MainActor
+    static func apply(pid: pid_t, enabled: Bool, gains: [Double]) -> Bool {
+        let wasVisible = equalizerWindowVisible()
+        setEqualizerWindowVisible(true)
+
+        let application = AXUIElementCreateApplication(pid)
+        guard let windows = attribute(application, kAXWindowsAttribute as CFString) as? [AXUIElement],
+              let window = windows.first(where: { (attribute($0, kAXTitleAttribute as CFString) as? String) == "Equalizer" }) else {
+            if !wasVisible { setEqualizerWindowVisible(false) }
+            return false
+        }
+
+        let elements = descendants(of: window)
+        if let checkbox = elements.first(where: { (attribute($0, kAXRoleAttribute as CFString) as? String) == kAXCheckBoxRole }) {
+            let currentValue = (attribute(checkbox, kAXValueAttribute as CFString) as? NSNumber)?.boolValue ?? false
+            if currentValue != enabled {
+                AXUIElementPerformAction(checkbox, kAXPressAction as CFString)
+            }
+        }
+
+        let sliders = elements.filter {
+            (attribute($0, kAXRoleAttribute as CFString) as? String) == kAXSliderRole &&
+            (attribute($0, kAXDescriptionAttribute as CFString) as? String) != "Preamp"
+        }.sorted { left, right in
+            xPosition(of: left) < xPosition(of: right)
+        }
+
+        guard sliders.count >= 10 else {
+            if !wasVisible { setEqualizerWindowVisible(false) }
+            return false
+        }
+
+        for (slider, gain) in zip(sliders.prefix(10), gains) {
+            AXUIElementSetAttributeValue(slider, kAXValueAttribute as CFString, NSNumber(value: gain))
+        }
+
+        if !wasVisible { setEqualizerWindowVisible(false) }
+        return true
+    }
+
+    private static func equalizerWindowVisible() -> Bool {
+        var error: NSDictionary?
+        let result = NSAppleScript(source: "tell application \"Music\" to get visible of EQ window 1")?
+            .executeAndReturnError(&error)
+        return error == nil && result?.booleanValue == true
+    }
+
+    private static func setEqualizerWindowVisible(_ visible: Bool) {
+        var error: NSDictionary?
+        NSAppleScript(source: "tell application \"Music\" to set visible of EQ window 1 to \(visible ? "true" : "false")")?
+            .executeAndReturnError(&error)
+    }
+
+    private static func descendants(of root: AXUIElement, depth: Int = 0) -> [AXUIElement] {
+        guard depth < 8 else { return [] }
+        let children = attribute(root, kAXChildrenAttribute as CFString) as? [AXUIElement] ?? []
+        return children + children.flatMap { descendants(of: $0, depth: depth + 1) }
+    }
+
+    private static func xPosition(of element: AXUIElement) -> CGFloat {
+        guard let rawValue = attribute(element, kAXPositionAttribute as CFString),
+              CFGetTypeID(rawValue) == AXValueGetTypeID() else { return .greatestFiniteMagnitude }
+        let value = unsafeDowncast(rawValue, to: AXValue.self)
+        var point = CGPoint.zero
+        AXValueGetValue(value, .cgPoint, &point)
+        return point.x
+    }
+
+    private static func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, name, &value) == .success else { return nil }
+        return value
+    }
+}
+
 struct SmartLevelView: View {
     @ObservedObject var leveler: SmartLevelController
 
@@ -939,6 +1528,116 @@ struct SmartLevelView: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .background(.black.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+struct GraphicEqualizerView: View {
+    @ObservedObject var equalizer: GraphicEqualizerController
+
+    var body: some View {
+        VStack(spacing: 7) {
+            HStack {
+                Toggle(isOn: $equalizer.isEnabled) {
+                    Label("10-Band EQ", systemImage: "slider.vertical.3")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                }
+                .toggleStyle(.switch)
+                .tint(.green)
+
+                Spacer()
+
+                Text(equalizer.status)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+
+                Button("Flat", action: equalizer.reset)
+                    .buttonStyle(.borderless)
+                    .controlSize(.mini)
+                    .disabled(!equalizer.isEnabled)
+            }
+
+            HStack(alignment: .top, spacing: 0) {
+                ForEach(GraphicEqualizerController.frequencies.indices, id: \.self) { index in
+                    VStack(spacing: 3) {
+                        Text(String(format: "%+.0f", equalizer.gains[index]))
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundStyle(.secondary)
+
+                        EQBandSlider(value: equalizer.binding(for: index))
+                            .accessibilityLabel("\(GraphicEqualizerController.frequencies[index]) hertz")
+                            .accessibilityValue("\(Int(equalizer.gains[index])) decibels")
+
+                        Text(GraphicEqualizerController.frequencies[index])
+                            .font(.system(size: 8, weight: .medium, design: .rounded))
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+            }
+            .disabled(!equalizer.isEnabled)
+            .opacity(equalizer.isEnabled ? 1 : 0.38)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(.black.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+private struct EQBandSlider: View {
+    @Binding var value: Double
+
+    var body: some View {
+        GeometryReader { geometry in
+            let height = max(geometry.size.height - 8, 1)
+            let centerY = geometry.size.height / 2
+            let fraction = (value + 12) / 24
+            let thumbY = 4 + height * (1 - fraction)
+            let fillTop = min(centerY, thumbY)
+            let fillHeight = max(abs(centerY - thumbY), 1)
+
+            ZStack {
+                Capsule()
+                    .fill(.black.opacity(0.40))
+                    .frame(width: 4, height: height)
+                    .position(x: geometry.size.width / 2, y: geometry.size.height / 2)
+
+                Capsule()
+                    .fill(Color.green.opacity(0.88))
+                    .frame(width: 4, height: fillHeight)
+                    .position(x: geometry.size.width / 2, y: fillTop + fillHeight / 2)
+                    .shadow(color: .green.opacity(0.55), radius: 3)
+
+                Rectangle()
+                    .fill(.white.opacity(0.28))
+                    .frame(width: 13, height: 1)
+                    .position(x: geometry.size.width / 2, y: centerY)
+
+                Circle()
+                    .fill(.white)
+                    .overlay(Circle().stroke(.green, lineWidth: 2))
+                    .frame(width: 13, height: 13)
+                    .position(x: geometry.size.width / 2, y: thumbY)
+                    .shadow(color: .green.opacity(0.65), radius: 4)
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { drag in
+                        let position = min(max(drag.location.y - 4, 0), height)
+                        value = (1 - position / height) * 24 - 12
+                        value = value.rounded()
+                    }
+            )
+        }
+        .frame(width: 18, height: 64)
+        .accessibilityAdjustableAction { direction in
+            switch direction {
+            case .increment: value = min(value + 1, 12)
+            case .decrement: value = max(value - 1, -12)
+            @unknown default: break
+            }
+        }
     }
 }
 
@@ -1213,13 +1912,20 @@ struct RotaryKnob: View {
                 .rotationEffect(.degrees(-135 + effectiveVolume * 270))
                 .shadow(radius: 2)
 
-            VStack(spacing: 1) {
-                Image(systemName: audio.isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                    .font(.system(size: 22, weight: .semibold))
-                Text(audio.isMuted ? "MUTED" : "\(Int(audio.volume * 100))%")
-                    .font(.system(size: 20, weight: .bold, design: .rounded))
+            Button(action: audio.toggleMute) {
+                Image(systemName: audio.isMuted ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                    .font(.system(size: 24, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 66, height: 66)
+                    .background(
+                        Circle()
+                            .fill(Color.red.opacity(audio.isMuted ? 0.78 : 0.42))
+                            .shadow(color: .red.opacity(audio.isMuted ? 0.95 : 0.45), radius: audio.isMuted ? 13 : 7)
+                    )
+                    .overlay(Circle().stroke(.white.opacity(0.28), lineWidth: 1))
             }
-            .foregroundStyle(audio.isMuted ? .secondary : .primary)
+            .buttonStyle(.plain)
+            .accessibilityLabel(audio.isMuted ? "Unmute" : "Mute")
         }
         .contentShape(Circle())
         .gesture(
@@ -1252,8 +1958,11 @@ struct VolumeControlView: View {
     @ObservedObject var audio: AudioController
     @ObservedObject var analyzer: SpectrumAnalyzer
     @ObservedObject var leveler: SmartLevelController
+    @ObservedObject var equalizer: GraphicEqualizerController
+    @ObservedObject var nowPlaying: NowPlayingController
     @ObservedObject var noise: PrivacyNoiseController
     @ObservedObject var detector: SoundDetectorController
+    @ObservedObject var capture: MediaCaptureController
     @State private var selectedPage = 0
     let closeWindow: () -> Void
 
@@ -1283,6 +1992,7 @@ struct VolumeControlView: View {
             Picker("Mode", selection: $selectedPage) {
                 Label("Volume", systemImage: "speaker.wave.2.fill").tag(0)
                 Label("Privacy", systemImage: "shield.lefthalf.filled").tag(1)
+                Label("Video", systemImage: "video.fill").tag(2)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
@@ -1290,6 +2000,7 @@ struct VolumeControlView: View {
             if selectedPage == 0 {
                 SpectrumView(analyzer: analyzer, detector: detector)
                 SmartLevelView(leveler: leveler)
+                GraphicEqualizerView(equalizer: equalizer)
                 RotaryKnob(audio: audio, analyzer: analyzer)
                     .frame(width: 154, height: 154)
 
@@ -1315,19 +2026,13 @@ struct VolumeControlView: View {
                     .accessibilityLabel("Volume up")
                 }
 
-                Button(action: audio.toggleMute) {
-                    Label(audio.isMuted ? "Unmute" : "Mute", systemImage: audio.isMuted ? "speaker.wave.2.fill" : "speaker.slash.fill")
-                        .font(.system(size: 16, weight: .semibold, design: .rounded))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 9)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(audio.isMuted ? .green : .red)
+                PlayerControlsView(player: nowPlaying)
+                NowPlayingView(player: nowPlaying)
 
                 Text("Drag the knob up/down or left/right")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
-            } else {
+            } else if selectedPage == 1 {
                 SpectrumView(analyzer: analyzer, detector: detector)
                 NoiseDetectorView(detector: detector)
                 PrivacyNoiseView(noise: noise)
@@ -1335,10 +2040,12 @@ struct VolumeControlView: View {
                 Text("Local only · no recording · start external amplifiers low")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
+            } else {
+                VideoCaptureView(capture: capture)
             }
         }
         .padding(18)
-        .frame(width: 330, height: 620, alignment: .top)
+        .frame(width: 330, height: 820, alignment: .top)
         .background(Color.black.opacity(0.42))
         .overlay {
             PulsingEdgeLight()
@@ -1347,17 +2054,219 @@ struct VolumeControlView: View {
     }
 }
 
-private struct PulsingEdgeLight: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var isGlowing = false
-    @State private var colorShift = false
+struct PlayerControlsView: View {
+    @ObservedObject var player: NowPlayingController
 
+    var body: some View {
+        HStack(spacing: 18) {
+            mediaButton(
+                symbol: "backward.fill",
+                label: "Previous track",
+                key: .previous,
+                size: 15
+            )
+
+            mediaButton(
+                symbol: "playpause.fill",
+                label: "Play or pause",
+                key: .playPause,
+                size: 22,
+                prominent: true
+            )
+
+            mediaButton(
+                symbol: "forward.fill",
+                label: "Next track",
+                key: .next,
+                size: 15
+            )
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 7)
+        .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(.white.opacity(0.10)))
+    }
+
+    private func mediaButton(
+        symbol: String,
+        label: String,
+        key: MediaKey,
+        size: CGFloat,
+        prominent: Bool = false
+    ) -> some View {
+        Button {
+            player.send(key)
+        } label: {
+            Image(systemName: symbol)
+                .font(.system(size: size, weight: .semibold))
+                .frame(width: prominent ? 52 : 42, height: 36)
+                .background(prominent ? Color.green.opacity(0.78) : Color.white.opacity(0.06), in: Capsule())
+                .shadow(color: prominent ? .green.opacity(0.48) : .clear, radius: 7)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+    }
+}
+
+struct NowPlayingView: View {
+    @ObservedObject var player: NowPlayingController
+
+    var body: some View {
+        VStack(spacing: 5) {
+            trackRow(label: "NOW", symbol: "waveform", value: player.current, active: true)
+            Divider().opacity(0.22)
+            trackRow(label: "NEXT", symbol: "forward.end.fill", value: player.upNext, active: false)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(.black.opacity(0.22), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(.white.opacity(0.10)))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Now playing \(player.current). Up next \(player.upNext)")
+    }
+
+    private func trackRow(label: String, symbol: String, value: String, active: Bool) -> some View {
+        HStack(spacing: 7) {
+            Image(systemName: symbol)
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(active ? .green : .secondary)
+                .frame(width: 13)
+            Text(label)
+                .font(.system(size: 8, weight: .bold, design: .rounded))
+                .foregroundStyle(.secondary)
+                .frame(width: 27, alignment: .leading)
+            Text(value)
+                .font(.system(size: 10, weight: active ? .semibold : .regular, design: .rounded))
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 0)
+        }
+    }
+}
+
+struct VideoCaptureView: View {
+    @ObservedObject var capture: MediaCaptureController
+
+    var body: some View {
+        VStack(spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("SCREEN CAPTURE")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                    Text("Draw a box around anything on screen")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Circle()
+                    .fill(capture.isCapturing ? .red : .green)
+                    .frame(width: 8, height: 8)
+                    .shadow(color: capture.isCapturing ? .red : .green, radius: 5)
+            }
+
+            Picker("Format", selection: $capture.mode) {
+                ForEach(MediaCaptureMode.allCases) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .disabled(capture.isCapturing)
+
+            ZStack {
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(.black.opacity(0.24))
+                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(.white.opacity(0.12)))
+                VStack(spacing: 10) {
+                    Image(systemName: capture.mode == .screenshot ? "viewfinder" : "record.circle")
+                        .font(.system(size: 52, weight: .light))
+                        .foregroundStyle(capture.isCapturing ? .red : .green)
+                        .shadow(color: capture.isCapturing ? .red.opacity(0.5) : .green.opacity(0.45), radius: 10)
+                    Text(capture.status)
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 230)
+                    HStack(spacing: 24) {
+                        Label(capture.elapsed, systemImage: "clock")
+                        Label(capture.fileSize, systemImage: "internaldrive")
+                    }
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                }
+                .padding()
+            }
+            .frame(height: 205)
+
+            if capture.isCapturing {
+                HStack(spacing: 10) {
+                    Button(action: capture.stop) {
+                        Label("Stop & Save", systemImage: "stop.fill")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
+
+                    Button(action: capture.cancel) {
+                        Image(systemName: "xmark")
+                            .frame(width: 30)
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityLabel("Cancel capture")
+                }
+            } else {
+                Button(action: capture.selectAndCapture) {
+                    Label(
+                        capture.mode == .screenshot ? "Select Area & Save PNG" : "Select Area & Record MP4",
+                        systemImage: "crop"
+                    )
+                    .font(.system(size: 14, weight: .semibold, design: .rounded))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.green)
+            }
+
+            VStack(spacing: 8) {
+                Button(action: capture.chooseOutputFolder) {
+                    HStack {
+                        Image(systemName: "externaldrive")
+                        Text(capture.outputFolder.path)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                    }
+                }
+                .buttonStyle(.plain)
+
+                HStack {
+                    Button("Open Last", action: capture.openLastCapture)
+                        .disabled(capture.lastCapture == nil)
+                    Spacer()
+                    Button("Permissions", action: capture.openScreenRecordingSettings)
+                }
+                .buttonStyle(.borderless)
+                .font(.caption)
+            }
+            .padding(12)
+            .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 10))
+
+            Spacer(minLength: 0)
+            Text("Native macOS selection · Retina and multiple displays supported")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.top, 4)
+    }
+}
+
+private struct PulsingEdgeLight: View {
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 17, style: .continuous)
-                .stroke(Color.blue, lineWidth: isGlowing ? 10 : 7)
-                .opacity(isGlowing ? 0.48 : 0.20)
-                .blur(radius: 6)
+                .stroke(Color.blue, lineWidth: 7)
+                .opacity(0.28)
+                .blur(radius: 4)
 
             RoundedRectangle(cornerRadius: 17, style: .continuous)
                 .stroke(
@@ -1375,31 +2284,18 @@ private struct PulsingEdgeLight: View {
                         ],
                         center: .center
                     ),
-                    lineWidth: isGlowing ? 4.0 : 2.4
+                    lineWidth: 2.8
                 )
-                .hueRotation(colorShift ? .degrees(360) : .zero)
-                .shadow(color: .cyan.opacity(isGlowing ? 0.95 : 0.50), radius: isGlowing ? 8 : 3)
+                .shadow(color: .cyan.opacity(0.62), radius: 4)
 
             RoundedRectangle(cornerRadius: 15, style: .continuous)
-                .stroke(Color.white.opacity(isGlowing ? 0.78 : 0.32), lineWidth: 0.9)
+                .stroke(Color.white.opacity(0.42), lineWidth: 0.9)
                 .padding(3)
         }
         .saturation(1.65)
-        .brightness(isGlowing ? 0.18 : 0.06)
+        .brightness(0.08)
         .blendMode(.screen)
         .padding(3)
-        .onAppear {
-            guard !reduceMotion else {
-                isGlowing = true
-                return
-            }
-            withAnimation(.easeInOut(duration: 1.15).repeatForever(autoreverses: true)) {
-                isGlowing = true
-            }
-            withAnimation(.linear(duration: 6.5).repeatForever(autoreverses: false)) {
-                colorShift = true
-            }
-        }
     }
 }
 
@@ -1408,8 +2304,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let audio = AudioController()
     private let analyzer = SpectrumAnalyzer()
     private lazy var leveler = SmartLevelController(audio: audio, analyzer: analyzer)
+    private lazy var equalizer = GraphicEqualizerController()
+    private lazy var nowPlaying = NowPlayingController()
     private lazy var noise = PrivacyNoiseController()
     private lazy var detector = SoundDetectorController(analyzer: analyzer, noise: noise)
+    private lazy var capture = MediaCaptureController()
     private var panel: NSPanel!
     private var statusItem: NSStatusItem!
 
@@ -1422,7 +2321,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func createPanel() {
         panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 330, height: 620),
+            contentRect: NSRect(x: 0, y: 0, width: 330, height: 820),
             styleMask: [.titled, .closable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -1439,12 +2338,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.backgroundColor = .clear
         panel.delegate = self
         panel.setFrameAutosaveName("VolumeKnobPanel")
-        panel.contentView = NSHostingView(rootView: VolumeControlView(audio: audio, analyzer: analyzer, leveler: leveler, noise: noise, detector: detector) { [weak self] in
-            self?.panel.orderOut(nil)
+        panel.contentView = NSHostingView(rootView: VolumeControlView(audio: audio, analyzer: analyzer, leveler: leveler, equalizer: equalizer, nowPlaying: nowPlaying, noise: noise, detector: detector, capture: capture) { [weak self] in
+            self?.hidePanel()
         })
         if !panel.setFrameUsingName("VolumeKnobPanel") {
             panel.center()
         }
+        panel.setContentSize(NSSize(width: 330, height: 820))
     }
 
     private func createMenuBarItem() {
@@ -1463,7 +2363,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func togglePanel() {
-        panel.isVisible ? panel.orderOut(nil) : showPanel()
+        panel.isVisible ? hidePanel() : showPanel()
     }
 
     @objc private func showPanelFromMenu() { showPanel() }
@@ -1471,12 +2371,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc private func quitApp() { NSApp.terminate(nil) }
 
     private func showPanel() {
+        analyzer.resume()
+        nowPlaying.resume()
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
     }
 
+    private func hidePanel() {
+        panel.orderOut(nil)
+        nowPlaying.suspend()
+        if !leveler.isEnabled && !detector.isEnabled {
+            analyzer.suspend()
+        }
+    }
+
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        sender.orderOut(nil)
+        hidePanel()
         return false
     }
 }

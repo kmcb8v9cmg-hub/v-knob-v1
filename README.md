@@ -13,7 +13,7 @@ Volume Knob is free to download and use. If it helps you, please consider a **su
 ## Features
 
 - Floating, always-on-top glass panel
-- Brilliant blue, cyan, violet, and white edge light with a smooth pulse
+- Brilliant blue, cyan, violet, and white energy-efficient edge light
 - Rotary drag and click control
 - Glowing red volume hash marks surrounding the green dial ring
 - Custom green volume slider with glowing red hash marks
@@ -25,6 +25,9 @@ Volume Knob is free to download and use. If it helps you, please consider a **su
 - Dedicated Mac Audio and Microphone modes
 - Sound-reactive glow around the knob
 - Optional Smart Level with Gentle-to-Strong control for consistent track loudness
+- Five-band graphic equalizer with presets
+- Now Playing information and media controls for Music and Spotify
+- User-initiated PNG screenshots and MP4 screen recordings with selectable output folders
 - Privacy screen with white, pink, brown, and speech-shaped noise
 - Adjustable microphone noise detector with spectrum alerts and calibration
 - Multi-speaker broadcasting through a macOS Multi-Output Device
@@ -33,8 +36,9 @@ Volume Knob is free to download and use. If it helps you, please consider a **su
 - Menu-bar access
 - No accounts, analytics, network requests, or audio recording
 - Native SwiftUI and Core Audio implementation
+- Companion iPhone project for local-file playback, EQ, and user-authorized ReplayKit capture
 
-Version 3.3 analyzes audio locally only to draw the spectrum. Audio samples are never recorded, saved, or transmitted. macOS asks permission before Mac Audio or Microphone access is enabled.
+Version 3.4.2 analyzes audio locally only to draw the spectrum and drive optional leveling or detection. Audio samples are never saved or transmitted. Screen captures are created only after the user selects PNG or MP4 capture and are saved to the chosen local folder. macOS asks permission before Mac Audio, Microphone, Screen Recording, or supported media-app automation is enabled.
 
 ## Requirements
 
@@ -72,6 +76,9 @@ To open Volume Knob automatically, add it under **System Settings â†’ General â†
 - Use the speaker-minus and speaker-plus buttons for 10% steps.
 - Select **Mute** to silence output and **Unmute** to restore it.
 - Select the speaker icon in the menu bar for quick access.
+- Use the equalizer presets or adjust individual frequency bands.
+- Use Now Playing to control Music or Spotify when either app is running.
+- Open the **Capture** tab to select a screen region and save a PNG or MP4 locally.
 - Choose **Auto**, **Mac Audio**, or **Microphone** beside the spectrum. Auto switches to the microphone after Mac audio is quiet for about one second.
 - Turn on **Smart Level** to slowly balance louder and quieter recordings. Set the strength from **Gentle** to **Strong**. Smart Level responds only to Mac audio and pauses when music stops or output is muted.
 - Open the **Privacy** tab to start a capped privacy-noise signal, set its type and timer, or enable the microphone noise detector.
@@ -87,6 +94,7 @@ Sources/VolumeKnob/main.swift
 Resources/Info.plist
 scripts/build-app.sh
 scripts/install.sh
+ios/VolumeKnobMobile/
 ```
 
 ## Privacy
