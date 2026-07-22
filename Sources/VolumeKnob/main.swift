@@ -530,10 +530,15 @@ final class SoundDetectorController: ObservableObject {
     @Published var isEnabled = false {
         didSet {
             if isEnabled {
-                if analyzer?.selectedSource == .system { analyzer?.selectedSource = .automatic }
+                sourceBeforeDetection = analyzer?.selectedSource
+                if analyzer?.selectedSource != .microphone { analyzer?.selectedSource = .microphone }
                 baseline = analyzer?.microphoneLevel ?? 0
                 state = .quiet
             } else {
+                if let sourceBeforeDetection {
+                    analyzer?.selectedSource = sourceBeforeDetection
+                    self.sourceBeforeDetection = nil
+                }
                 state = .quiet
                 intensity = 0
             }
@@ -545,6 +550,7 @@ final class SoundDetectorController: ObservableObject {
 
     private weak var analyzer: SpectrumAnalyzer?
     private weak var noise: PrivacyNoiseController?
+    private var sourceBeforeDetection: SpectrumSource?
     private var baseline: Float = 0
     private var timer: Timer?
 
@@ -673,8 +679,7 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
 
         switch selectedSource {
         case .automatic:
-            activeSource = "Requesting audio access…"
-            startMicrophone(generation: currentGeneration)
+            activeSource = "Requesting Mac Audio…"
             Task { await startSystemAudio(generation: currentGeneration) }
         case .system:
             activeSource = "Requesting Mac Audio…"
@@ -786,11 +791,11 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
             stream = newStream
             try await newStream.startCapture()
             if selectedSource == .system { activeSource = "Mac Audio" }
-            if selectedSource == .automatic { activeSource = "Auto · Microphone" }
+            if selectedSource == .automatic { activeSource = "Auto · Mac Audio" }
         } catch {
             guard generation == self.generation else { return }
             if selectedSource == .system { activeSource = "Allow Screen Recording access" }
-            if selectedSource == .automatic { activeSource = "Auto · Microphone" }
+            if selectedSource == .automatic { activeSource = "Auto · Mac Audio unavailable" }
         }
     }
 
@@ -798,43 +803,98 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
         guard outputType == .audio,
               sampleGate.shouldProcess(.system),
               CMSampleBufferDataIsReady(sampleBuffer),
-              let block = CMSampleBufferGetDataBuffer(sampleBuffer),
               let format = CMSampleBufferGetFormatDescription(sampleBuffer),
               let description = CMAudioFormatDescriptionGetStreamBasicDescription(format) else { return }
 
-        var length = 0
-        var totalLength = 0
-        var rawPointer: UnsafeMutablePointer<Int8>?
-        guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: &length, totalLengthOut: &totalLength, dataPointerOut: &rawPointer) == kCMBlockBufferNoErr,
-              let rawPointer, totalLength > 0 else { return }
-
-        let channels = max(Int(description.pointee.mChannelsPerFrame), 1)
-        let flags = description.pointee.mFormatFlags
-        var samples: [Float] = []
-
-        if flags & kAudioFormatFlagIsFloat != 0, description.pointee.mBitsPerChannel == 32 {
-            let values = rawPointer.withMemoryRebound(to: Float.self, capacity: totalLength / 4) {
-                UnsafeBufferPointer(start: $0, count: totalLength / 4)
-            }
-            samples = stride(from: 0, to: min(values.count, 2048), by: channels).map { values[$0] }
-        } else if description.pointee.mBitsPerChannel == 16 {
-            let values = rawPointer.withMemoryRebound(to: Int16.self, capacity: totalLength / 2) {
-                UnsafeBufferPointer(start: $0, count: totalLength / 2)
-            }
-            samples = stride(from: 0, to: min(values.count, 2048), by: channels).map { Float(values[$0]) / Float(Int16.max) }
-        }
-
+        let samples = Self.systemSamples(from: sampleBuffer, description: description)
         guard !samples.isEmpty else { return }
         Task { @MainActor [weak self] in
-            guard let self else { return }
+            guard let self, stream === self.stream else { return }
             self.accept(samples: samples, origin: .system, generation: self.generation)
         }
     }
 
+    private nonisolated static func systemSamples(
+        from sampleBuffer: CMSampleBuffer,
+        description: UnsafePointer<AudioStreamBasicDescription>
+    ) -> [Float] {
+        var listSize = 0
+        guard CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: &listSize,
+            bufferListOut: nil,
+            bufferListSize: 0,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: UInt32(kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment),
+            blockBufferOut: nil
+        ) == noErr, listSize >= MemoryLayout<AudioBufferList>.size else { return [] }
+
+        let storage = UnsafeMutableRawPointer.allocate(
+            byteCount: listSize,
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { storage.deallocate() }
+        let list = storage.assumingMemoryBound(to: AudioBufferList.self)
+        var retainedBlockBuffer: CMBlockBuffer?
+        guard CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: nil,
+            bufferListOut: list,
+            bufferListSize: listSize,
+            blockBufferAllocator: kCFAllocatorDefault,
+            blockBufferMemoryAllocator: kCFAllocatorDefault,
+            flags: UInt32(kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment),
+            blockBufferOut: &retainedBlockBuffer
+        ) == noErr else { return [] }
+
+        let buffers = UnsafeMutableAudioBufferListPointer(list)
+        let bits = Int(description.pointee.mBitsPerChannel)
+        let bytesPerSample = max(bits / 8, 1)
+        var frameCount = min(CMSampleBufferGetNumSamples(sampleBuffer), 1024)
+        var channelCount = 0
+        for buffer in buffers {
+            let channels = max(Int(buffer.mNumberChannels), 1)
+            channelCount += channels
+            frameCount = min(frameCount, Int(buffer.mDataByteSize) / (bytesPerSample * channels))
+        }
+        guard frameCount > 0, channelCount > 0 else { return [] }
+
+        var samples = [Float](repeating: 0, count: frameCount)
+        let flags = description.pointee.mFormatFlags
+        if flags & kAudioFormatFlagIsFloat != 0, bits == 32 {
+            for buffer in buffers {
+                guard let data = buffer.mData?.assumingMemoryBound(to: Float.self) else { continue }
+                let channels = max(Int(buffer.mNumberChannels), 1)
+                for frame in 0..<frameCount {
+                    for channel in 0..<channels {
+                        samples[frame] += data[frame * channels + channel]
+                    }
+                }
+            }
+        } else if flags & kAudioFormatFlagIsSignedInteger != 0, bits == 16 {
+            for buffer in buffers {
+                guard let data = buffer.mData?.assumingMemoryBound(to: Int16.self) else { continue }
+                let channels = max(Int(buffer.mNumberChannels), 1)
+                for frame in 0..<frameCount {
+                    for channel in 0..<channels {
+                        samples[frame] += Float(data[frame * channels + channel]) / Float(Int16.max)
+                    }
+                }
+            }
+        } else {
+            return []
+        }
+
+        let divisor = Float(channelCount)
+        for index in samples.indices { samples[index] /= divisor }
+        return samples
+    }
+
     nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
         Task { @MainActor [weak self] in
-            guard let self, self.selectedSource == .system else { return }
-            self.activeSource = "Mac Audio stopped"
+            guard let self, self.selectedSource != .microphone else { return }
+            self.activeSource = self.selectedSource == .automatic ? "Auto · Mac Audio stopped" : "Mac Audio stopped"
         }
     }
 
@@ -861,10 +921,8 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
             }
         }
         if selectedSource == .automatic {
-            let useSystem = now.timeIntervalSince(lastSystemSignal) < 1.25
-            guard (origin == .system && useSystem) || (origin == .microphone && !useSystem) else { return }
-            let sourceLabel = useSystem ? "Auto · Mac Audio" : "Auto · Microphone"
-            if activeSource != sourceLabel { activeSource = sourceLabel }
+            guard origin == .system else { return }
+            if activeSource != "Auto · Mac Audio" { activeSource = "Auto · Mac Audio" }
         } else if selectedSource != origin {
             return
         }
@@ -899,13 +957,13 @@ final class SpectrumAnalyzer: NSObject, ObservableObject, SCStreamOutput, SCStre
             peakDBFS = max(liveDBFS, peakDBFS - 1.2)
         }
 
-        guard selectedSource != .system,
+        guard selectedSource == .microphone,
               AVCaptureDevice.authorizationStatus(for: .audio) == .authorized,
               now.timeIntervalSince(lastMicrophoneSample) > 2.5,
               now.timeIntervalSince(lastMicrophoneRecovery) > 3.0 else { return }
 
         lastMicrophoneRecovery = now
-        activeSource = selectedSource == .automatic ? "Auto · Reconnecting microphone…" : "Reconnecting microphone…"
+        activeSource = "Reconnecting microphone…"
         startMicrophone(generation: generation)
     }
 

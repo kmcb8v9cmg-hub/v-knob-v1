@@ -21,7 +21,7 @@ Volume Knob is free to download and use. If it helps you, please consider a **su
 - Large mute/unmute button
 - Real-time 24-band spectrum analyzer with dBFS levels, peak hold, frequency scale, and signal-strength colors
 - Automatic analyzer decay and microphone reconnection if an input stalls
-- Auto mode prefers Mac audio and falls back to the microphone when music stops
+- Headphone-safe Auto mode analyzes Mac audio without opening a Bluetooth headset microphone
 - Dedicated Mac Audio and Microphone modes
 - Sound-reactive glow around the knob
 - Optional Smart Level with Gentle-to-Strong control for consistent track loudness
@@ -79,9 +79,10 @@ To open Volume Knob automatically, add it under **System Settings â†’ General â†
 - Use the equalizer presets or adjust individual frequency bands.
 - Use Now Playing to control Music or Spotify when either app is running.
 - Open the **Capture** tab to select a screen region and save a PNG or MP4 locally.
-- Choose **Auto**, **Mac Audio**, or **Microphone** beside the spectrum. Auto switches to the microphone after Mac audio is quiet for about one second.
+- Choose **Auto**, **Mac Audio**, or **Microphone** beside the spectrum. Auto uses Mac audio only so Bluetooth headphones remain in their high-quality playback profile. Choose Microphone explicitly only when you need ambient sound analysis.
 - Turn on **Smart Level** to slowly balance louder and quieter recordings. Set the strength from **Gentle** to **Strong**. Smart Level responds only to Mac audio and pauses when music stops or output is muted.
 - Open the **Privacy** tab to start a capped privacy-noise signal, set its type and timer, or enable the microphone noise detector.
+- Enabling the microphone noise detector temporarily selects Microphone mode and restores your previous source when disabled. Bluetooth headsets may enter their call profile while microphone capture is intentionally active.
 - Use **Speaker Setup** to open Audio MIDI Setup. Create and select a Multi-Output Device to broadcast through several compatible speakers.
 - Start connected amplifiers at a low level. The in-app generator is capped, but external hardware can still make the output dangerously loud.
 - Privacy Noise starts at 26% and can be raised to 60%; increase it gradually, especially with amplified or multi-speaker outputs.

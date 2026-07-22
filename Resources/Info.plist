@@ -19,7 +19,7 @@
 	<key>CFBundleVersion</key>
 	<string>21</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Volume Knob uses the microphone only to animate its live spectrum when microphone mode is active.</string>
+	<string>Volume Knob uses the microphone only when Microphone mode or the user-enabled sound detector is active.</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>Volume Knob uses screen access for the live Mac-audio spectrum and user-selected PNG or MP4 screen capture.</string>
 	<key>NSAppleEventsUsageDescription</key>
