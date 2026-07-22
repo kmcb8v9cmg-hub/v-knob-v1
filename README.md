@@ -13,7 +13,7 @@ Volume Knob is free to download and use. If it helps you, please consider a **su
 ## Features
 
 - Floating, always-on-top glass panel
-- Brilliant blue, cyan, violet, and white edge light with a smooth pulse
+- Brilliant blue, cyan, violet, and white energy-efficient edge light
 - Rotary drag and click control
 - Glowing red volume hash marks surrounding the green dial ring
 - Custom green volume slider with glowing red hash marks
@@ -21,10 +21,13 @@ Volume Knob is free to download and use. If it helps you, please consider a **su
 - Large mute/unmute button
 - Real-time 24-band spectrum analyzer with dBFS levels, peak hold, frequency scale, and signal-strength colors
 - Automatic analyzer decay and microphone reconnection if an input stalls
-- Auto mode prefers Mac audio and falls back to the microphone when music stops
+- Headphone-safe Auto mode analyzes Mac audio without opening a Bluetooth headset microphone
 - Dedicated Mac Audio and Microphone modes
 - Sound-reactive glow around the knob
 - Optional Smart Level with Gentle-to-Strong control for consistent track loudness
+- Five-band graphic equalizer with presets
+- Now Playing information and media controls for Music and Spotify
+- User-initiated PNG screenshots and MP4 screen recordings with selectable output folders
 - Privacy screen with white, pink, brown, and speech-shaped noise
 - Adjustable microphone noise detector with spectrum alerts and calibration
 - Multi-speaker broadcasting through a macOS Multi-Output Device
@@ -33,8 +36,9 @@ Volume Knob is free to download and use. If it helps you, please consider a **su
 - Menu-bar access
 - No accounts, analytics, network requests, or audio recording
 - Native SwiftUI and Core Audio implementation
+- Companion iPhone project for local-file playback, EQ, and user-authorized ReplayKit capture
 
-Version 3.3 analyzes audio locally only to draw the spectrum. Audio samples are never recorded, saved, or transmitted. macOS asks permission before Mac Audio or Microphone access is enabled.
+Version 3.4.2 analyzes audio locally only to draw the spectrum and drive optional leveling or detection. Audio samples are never saved or transmitted. Screen captures are created only after the user selects PNG or MP4 capture and are saved to the chosen local folder. macOS asks permission before Mac Audio, Microphone, Screen Recording, or supported media-app automation is enabled.
 
 ## Requirements
 
@@ -72,9 +76,13 @@ To open Volume Knob automatically, add it under **System Settings â†’ General â†
 - Use the speaker-minus and speaker-plus buttons for 10% steps.
 - Select **Mute** to silence output and **Unmute** to restore it.
 - Select the speaker icon in the menu bar for quick access.
-- Choose **Auto**, **Mac Audio**, or **Microphone** beside the spectrum. Auto switches to the microphone after Mac audio is quiet for about one second.
+- Use the equalizer presets or adjust individual frequency bands.
+- Use Now Playing to control Music or Spotify when either app is running.
+- Open the **Capture** tab to select a screen region and save a PNG or MP4 locally.
+- Choose **Auto**, **Mac Audio**, or **Microphone** beside the spectrum. Auto uses Mac audio only so Bluetooth headphones remain in their high-quality playback profile. Choose Microphone explicitly only when you need ambient sound analysis.
 - Turn on **Smart Level** to slowly balance louder and quieter recordings. Set the strength from **Gentle** to **Strong**. Smart Level responds only to Mac audio and pauses when music stops or output is muted.
 - Open the **Privacy** tab to start a capped privacy-noise signal, set its type and timer, or enable the microphone noise detector.
+- Enabling the microphone noise detector temporarily selects Microphone mode and restores your previous source when disabled. Bluetooth headsets may enter their call profile while microphone capture is intentionally active.
 - Use **Speaker Setup** to open Audio MIDI Setup. Create and select a Multi-Output Device to broadcast through several compatible speakers.
 - Start connected amplifiers at a low level. The in-app generator is capped, but external hardware can still make the output dangerously loud.
 - Privacy Noise starts at 26% and can be raised to 60%; increase it gradually, especially with amplified or multi-speaker outputs.
@@ -87,6 +95,7 @@ Sources/VolumeKnob/main.swift
 Resources/Info.plist
 scripts/build-app.sh
 scripts/install.sh
+ios/VolumeKnobMobile/
 ```
 
 ## Privacy

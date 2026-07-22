@@ -15,13 +15,15 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>3.3</string>
+	<string>3.4.2</string>
 	<key>CFBundleVersion</key>
-	<string>12</string>
+	<string>21</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Volume Knob uses the microphone only to animate its live spectrum when microphone mode is active.</string>
+	<string>Volume Knob uses the microphone only when Microphone mode or the user-enabled sound detector is active.</string>
 	<key>NSScreenCaptureUsageDescription</key>
-	<string>Volume Knob uses Mac audio access only to draw a live spectrum of sound playing on this Mac.</string>
+	<string>Volume Knob uses screen access for the live Mac-audio spectrum and user-selected PNG or MP4 screen capture.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Volume Knob reads the current track and upcoming Apple Music queue for its Now Playing display.</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>LSUIElement</key>

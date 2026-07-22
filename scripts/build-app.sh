@@ -7,7 +7,7 @@ DIST_DIR="$PROJECT_DIR/dist"
 APP_DIR="$DIST_DIR/$APP_NAME"
 
 cd "$PROJECT_DIR"
-swift build -c release
+swift build -c release --disable-sandbox --cache-path /private/tmp/volume_knob_swiftpm_cache
 
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
@@ -19,4 +19,3 @@ codesign --force --deep --sign - "$APP_DIR"
 codesign --verify --deep --strict "$APP_DIR"
 
 echo "Built: $APP_DIR"
-
