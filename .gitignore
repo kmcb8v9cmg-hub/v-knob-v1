@@ -6,5 +6,5 @@ build-v*/
 dist/
 DerivedData/
 *.xcuserstate
+xcuserdata/
 *.zip
-
