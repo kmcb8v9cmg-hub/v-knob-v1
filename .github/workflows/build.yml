@@ -9,13 +9,12 @@ jobs:
   macos:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build application
         run: ./scripts/build-app.sh
       - name: Package application
         run: ditto -c -k --sequesterRsrc --keepParent "dist/Volume Knob.app" "dist/Volume-Knob.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: Volume-Knob-macOS
           path: dist/Volume-Knob.zip
-
