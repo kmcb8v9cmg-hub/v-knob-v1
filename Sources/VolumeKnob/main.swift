@@ -331,7 +331,11 @@ final class MediaCaptureController: ObservableObject {
             return
         }
         do {
-            try await exporter.export(to: destination, as: .mp4)
+            if #available(macOS 15.0, *) {
+                try await exporter.export(to: destination, as: .mp4)
+            } else {
+                try await exportLegacy(exporter, to: destination)
+            }
             try? FileManager.default.removeItem(at: source)
             lastCapture = destination
             workingURL = destination
@@ -340,6 +344,33 @@ final class MediaCaptureController: ObservableObject {
         } catch {
             lastCapture = source
             status = "Video saved as MOV · MP4 conversion unavailable"
+        }
+    }
+
+    @available(macOS, introduced: 10.7, obsoleted: 15.0)
+    private func exportLegacy(
+        _ exporter: AVAssetExportSession,
+        to destination: URL
+    ) async throws {
+        exporter.outputURL = destination
+        exporter.outputFileType = .mp4
+        await withCheckedContinuation { continuation in
+            exporter.exportAsynchronously {
+                continuation.resume()
+            }
+        }
+
+        if let error = exporter.error {
+            throw error
+        }
+        guard exporter.status == .completed else {
+            throw NSError(
+                domain: "VolumeKnob.MediaCapture",
+                code: Int(exporter.status.rawValue),
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Video export did not complete."
+                ]
+            )
         }
     }
 
